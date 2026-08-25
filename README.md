@@ -1,1 +1,1 @@
-# grimmory-n8n-format-automation
+# grimmory-format-automation
