@@ -1,0 +1,80 @@
+{
+  "content": [
+    {
+      "id": 10,
+      "metadata": {
+        "title": "First Book",
+        "authors": [
+          "Second Author",
+          "First Author"
+        ],
+        "language": "en",
+        "publisher": "Example Press",
+        "publicationDate": "2024-01-02",
+        "identifiers": {
+          "ISBN": "9780000000001",
+          "goodreads": "g-10"
+        },
+        "series": "Example Series",
+        "seriesIndex": 1,
+        "tags": [
+          "zeta",
+          "alpha",
+          "zeta"
+        ],
+        "description": "A first book.",
+        "comments": "Keep this comment."
+      },
+      "primaryFile": {
+        "id": 1001,
+        "fileName": "first.epub",
+        "bookType": "EPUB",
+        "extension": ".epub",
+        "fileSizeKb": 1200
+      },
+      "alternativeFormats": [
+        {
+          "id": 1002,
+          "fileName": "first.mobi",
+          "bookType": "MOBI",
+          "extension": ".mobi",
+          "fileSizeKb": 900
+        }
+      ],
+      "supplementaryFiles": [
+        {
+          "id": 1003,
+          "fileName": "first.jpg",
+          "bookType": "IMAGE",
+          "extension": ".jpg",
+          "fileSizeKb": 80
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "metadata": {
+        "title": "Second Book"
+      },
+      "primaryFile": {
+        "id": 2001,
+        "fileName": "second.azw3",
+        "bookType": "AZW3",
+        "extension": "azw3",
+        "fileSizeKb": 800
+      },
+      "alternativeFormats": [],
+      "supplementaryFiles": []
+    }
+  ],
+  "links": {
+    "self": "/api/v1/books/page?page=0&size=100",
+    "next": "/api/v1/books/page?page=1&size=100"
+  },
+  "page": {
+    "size": 100,
+    "number": 0,
+    "totalElements": 3,
+    "totalPages": 2
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "id": "book-1",
+  "libraryId": "library-1",
+  "metadata": {
+    "title": "First Book",
+    "description": "First description."
+  },
+  "primaryFile": null,
+  "alternativeFormats": []
+}

@@ -1,0 +1,25 @@
+{
+  "content": [
+    {
+      "id": "30",
+      "primaryFile": {
+        "id": "3001",
+        "fileName": "third.epub",
+        "bookType": "EPUB",
+        "fileSizeKb": 700
+      },
+      "alternativeFormats": [],
+      "supplementaryFiles": []
+    }
+  ],
+  "links": {
+    "self": "/api/v1/books/page?page=1&size=100",
+    "next": "/api/v1/books/page?page=2&size=100"
+  },
+  "page": {
+    "size": 100,
+    "number": 1,
+    "totalElements": 3,
+    "totalPages": 3
+  }
+}

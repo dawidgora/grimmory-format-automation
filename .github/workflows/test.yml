@@ -1,0 +1,43 @@
+name: Go checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go checks and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: converter
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: converter/go.mod
+
+      - name: Check gofmt
+        shell: bash
+        run: |
+          files="$(gofmt -l .)"
+          if [[ -n "${files}" ]]; then
+            printf 'gofmt required for:\n%s\n' "${files}"
+            exit 1
+          fi
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go test
+        run: go test ./...
+
+      - name: Go build
+        run: go build ./...

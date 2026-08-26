@@ -1,0 +1,18 @@
+root = "/workspace"
+tmp_dir = "tmp"
+
+[build]
+  bin = "./tmp/converter"
+  cmd = "go build -mod=readonly -o ./tmp/converter ./cmd/server"
+  delay = 1000
+  exclude_dir = ["tmp", "vendor", "testdata"]
+  include_ext = ["go"]
+  kill_delay = "500ms"
+  send_interrupt = true
+  stop_on_error = true
+
+[log]
+  time = true
+
+[misc]
+  clean_on_exit = true

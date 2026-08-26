@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+api-key
+*.db
+*.db-*
+data/
+logs/
+server
+converter
+coverage*
+*.test
+testdata

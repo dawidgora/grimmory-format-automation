@@ -1,0 +1,35 @@
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+!.env.dist
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Service runtime state and local data
+/data/
+/converter/data/
+# Keep local ebook content out of the repository; it is not a service path.
+/books/
+*.db
+*.db-shm
+*.db-wal
+
+# Go build and test output
+coverage.out
+coverage.html
+*.test
+/converter/bin/
+/converter/server
+
+# Logs and temporary files
+*.log
+tmp/
+dist/
+
+# Local deepwork progress
+.slim/deepwork/
