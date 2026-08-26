@@ -2,6 +2,7 @@
 [x] replace “terminal failed” with “retry exhausted” wording
 [] deslopify the code
 [] condider removing k8s for now - later helm chart
+[] ci: tests, build, push to registry
 [] ai review
 [] security ai review
 [] readme.md
