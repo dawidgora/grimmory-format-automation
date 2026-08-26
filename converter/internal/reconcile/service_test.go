@@ -648,6 +648,9 @@ func (*lockingRemote) UploadFileNamedScoped(context.Context, grimmory.BookRefere
 func (*lockingRemote) UploadFileScoped(context.Context, grimmory.BookReference, string, string) error {
 	return nil
 }
+func (*lockingRemote) DeleteFileScoped(context.Context, grimmory.BookReference, string) error {
+	return nil
+}
 
 func fmtHash(value []byte) string {
 	result := ""

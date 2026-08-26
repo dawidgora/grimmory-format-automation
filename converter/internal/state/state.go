@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -57,77 +56,6 @@ CREATE TABLE IF NOT EXISTS poll_state (
     updated_at_ns INTEGER NOT NULL,
     PRIMARY KEY (library_id, book_id)
 );`
-
-// The initial library-aware release reuses the original table names. There is
-// no safe way to assign an old unscoped row to a library, so an incompatible
-// existing state schema is reset transactionally and its checkpoints are
-// intentionally discarded. The reset also removes the *_v2 tables written by
-// an intermediate development build; those tables are never created here.
-var stateTableSpecs = map[string]tableSpec{
-	"book_state": {
-		columns: []columnSpec{
-			{name: "library_id", typ: "TEXT", notNull: true, primaryKey: 1},
-			{name: "book_id", typ: "TEXT", notNull: true, primaryKey: 2},
-			{name: "main_format", typ: "TEXT", notNull: true},
-			{name: "canonical_format", typ: "TEXT", notNull: true},
-			{name: "canonical_file_id", typ: "TEXT"},
-			{name: "canonical_file_name", typ: "TEXT"},
-			{name: "canonical_sha256", typ: "TEXT", notNull: true},
-			{name: "metadata_fingerprint", typ: "TEXT"},
-			{name: "canonical_mtime_ns", typ: "INTEGER"},
-			{name: "last_successful_sync_ns", typ: "INTEGER"},
-			{name: "updated_at_ns", typ: "INTEGER", notNull: true},
-		},
-	},
-	"derived": {
-		columns: []columnSpec{
-			{name: "library_id", typ: "TEXT", notNull: true, primaryKey: 1},
-			{name: "book_id", typ: "TEXT", notNull: true, primaryKey: 2},
-			{name: "format", typ: "TEXT", notNull: true, primaryKey: 3},
-			{name: "grimmory_file_id", typ: "TEXT"},
-			{name: "source_sha256", typ: "TEXT", notNull: true},
-			{name: "output_sha256", typ: "TEXT", notNull: true},
-			{name: "generation_fingerprint", typ: "TEXT"},
-			{name: "trusted_mtime_ns", typ: "INTEGER"},
-			{name: "generated_at_ns", typ: "INTEGER"},
-			{name: "updated_at_ns", typ: "INTEGER", notNull: true},
-		},
-		foreignKey: true,
-	},
-	"poll_state": {
-		columns: []columnSpec{
-			{name: "library_id", typ: "TEXT", notNull: true, primaryKey: 1},
-			{name: "book_id", typ: "TEXT", notNull: true, primaryKey: 2},
-			{name: "observation_fingerprint", typ: "TEXT", notNull: true},
-			{name: "applied_fingerprint", typ: "TEXT"},
-			{name: "status", typ: "TEXT", notNull: true},
-			{name: "attempt_count", typ: "INTEGER", notNull: true, defaultValue: "0"},
-			{name: "next_attempt_at_ns", typ: "INTEGER"},
-			{name: "error_code", typ: "TEXT"},
-			{name: "last_seen_at_ns", typ: "INTEGER", notNull: true},
-			{name: "updated_at_ns", typ: "INTEGER", notNull: true},
-		},
-		requiredSQLParts: []string{
-			"check (status in ('current', 'pending', 'retry', 'failed'))",
-			"check (attempt_count >= 0)",
-			"check (error_code is null or length(error_code) between 1 and 64)",
-		},
-	},
-}
-
-type columnSpec struct {
-	name         string
-	typ          string
-	notNull      bool
-	primaryKey   int
-	defaultValue string
-}
-
-type tableSpec struct {
-	columns          []columnSpec
-	foreignKey       bool
-	requiredSQLParts []string
-}
 
 const (
 	PollStatusCurrent = "current"
@@ -257,204 +185,10 @@ func (s *Store) configure(busyTimeout time.Duration) error {
 			return fmt.Errorf("configure state database: %w", err)
 		}
 	}
-	if err := s.migrate(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *Store) migrate() error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin state schema migration: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	incompatible, err := hasIncompatibleStateTables(tx)
-	if err != nil {
-		return fmt.Errorf("inspect state schema: %w", err)
-	}
-	if incompatible {
-		// The old tables have no library owner. Dropping them in the same
-		// transaction as the rebuild means a failed migration leaves the old
-		// database untouched rather than leaving a half-reset state store.
-		for _, table := range []string{"derived", "poll_state", "book_state"} {
-			if err := dropStateObject(tx, table); err != nil {
-				return fmt.Errorf("reset state table %s: %w", table, err)
-			}
-		}
-	}
-	// *_v2 tables were produced by an intermediate build. They are not part
-	// of this release and must not remain as alternate sources of state.
-	for _, table := range []string{"derived_v2", "poll_state_v2", "book_state_v2"} {
-		if err := dropStateObject(tx, table); err != nil {
-			return fmt.Errorf("remove alternate state table %s: %w", table, err)
-		}
-	}
-	if _, err := tx.Exec(schema); err != nil {
+	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("create state schema: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit state schema migration: %w", err)
-	}
 	return nil
-}
-
-func hasIncompatibleStateTables(tx *sql.Tx) (bool, error) {
-	for _, table := range []string{"book_state", "derived", "poll_state"} {
-		spec := stateTableSpecs[table]
-		exists, err := stateObjectExists(tx, table)
-		if err != nil {
-			return false, err
-		}
-		if !exists {
-			continue
-		}
-		compatible, err := compatibleStateTable(tx, table, spec)
-		if err != nil {
-			return false, err
-		}
-		if !compatible {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func stateObjectExists(tx *sql.Tx, name string) (bool, error) {
-	var objectType string
-	err := tx.QueryRow(`SELECT type FROM sqlite_master WHERE lower(name) = lower(?)`, name).Scan(&objectType)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return objectType != "", nil
-}
-
-func compatibleStateTable(tx *sql.Tx, name string, spec tableSpec) (bool, error) {
-	var objectType string
-	if err := tx.QueryRow(`SELECT type FROM sqlite_master WHERE lower(name) = lower(?)`, name).Scan(&objectType); err != nil {
-		return false, err
-	}
-	if objectType != "table" {
-		return false, nil
-	}
-
-	rows, err := tx.Query(`PRAGMA table_info("` + name + `")`)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	index := 0
-	for rows.Next() {
-		var cid, notNull, primaryKey int
-		var columnName, columnType string
-		var defaultValue any
-		if err := rows.Scan(&cid, &columnName, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
-			return false, err
-		}
-		if index >= len(spec.columns) {
-			return false, nil
-		}
-		expected := spec.columns[index]
-		if columnName != expected.name || !strings.EqualFold(columnType, expected.typ) || (notNull != 0) != expected.notNull || primaryKey != expected.primaryKey {
-			return false, nil
-		}
-		if expected.defaultValue != "" && (defaultValue == nil || strings.TrimSpace(fmt.Sprint(defaultValue)) != expected.defaultValue) {
-			return false, nil
-		}
-		index++
-	}
-	if err := rows.Err(); err != nil {
-		return false, err
-	}
-	if index != len(spec.columns) {
-		return false, nil
-	}
-	if len(spec.requiredSQLParts) > 0 {
-		var createSQL sql.NullString
-		if err := tx.QueryRow(`SELECT sql FROM sqlite_master WHERE lower(name) = lower(?) AND type = 'table'`, name).Scan(&createSQL); err != nil {
-			return false, err
-		}
-		if !createSQL.Valid {
-			return false, nil
-		}
-		sqlText := strings.ToLower(strings.Join(strings.Fields(createSQL.String), " "))
-		for _, part := range spec.requiredSQLParts {
-			if !strings.Contains(sqlText, part) {
-				return false, nil
-			}
-		}
-	}
-	if spec.foreignKey {
-		return hasDerivedForeignKey(tx)
-	}
-	return true, nil
-}
-
-func hasDerivedForeignKey(tx *sql.Tx) (bool, error) {
-	rows, err := tx.Query(`PRAGMA foreign_key_list("derived")`)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	refs := make(map[string]string, 2)
-	foreignKeyID := -1
-	sequences := map[string]int{"library_id": 0, "book_id": 1}
-	rowCount := 0
-	for rows.Next() {
-		var id, sequence int
-		var tableName, from, to, onUpdate, onDelete, match string
-		if err := rows.Scan(&id, &sequence, &tableName, &from, &to, &onUpdate, &onDelete, &match); err != nil {
-			return false, err
-		}
-		rowCount++
-		if rowCount > 2 || tableName != "book_state" || onDelete != "CASCADE" || from == "" || to == "" {
-			return false, nil
-		}
-		if foreignKeyID >= 0 && id != foreignKeyID {
-			return false, nil
-		}
-		foreignKeyID = id
-		if expectedSequence, ok := sequences[from]; !ok || sequence != expectedSequence {
-			return false, nil
-		}
-		if _, exists := refs[from]; exists {
-			return false, nil
-		}
-		refs[from] = to
-	}
-	if err := rows.Err(); err != nil {
-		return false, err
-	}
-	return rowCount == 2 && len(refs) == 2 && refs["library_id"] == "library_id" && refs["book_id"] == "book_id", nil
-}
-
-func dropStateObject(tx *sql.Tx, name string) error {
-	var objectType string
-	err := tx.QueryRow(`SELECT type FROM sqlite_master WHERE lower(name) = lower(?)`, name).Scan(&objectType)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	statement := "DROP TABLE "
-	switch objectType {
-	case "view":
-		statement = "DROP VIEW "
-	case "index":
-		statement = "DROP INDEX "
-	case "trigger":
-		statement = "DROP TRIGGER "
-	case "table":
-	default:
-		return fmt.Errorf("unsupported SQLite object type %q", objectType)
-	}
-	_, err = tx.Exec(statement + `"` + name + `"`)
-	return err
 }
 
 func (s *Store) Close() error {
@@ -516,24 +250,14 @@ func (s *Store) Get(ctx context.Context, libraryID, bookID string) (BookState, m
 	return result, derived, nil
 }
 
-// The explicit Scoped spellings are kept as harmless source aliases for
-// consumers migrating to the library-aware signatures. They still require a
-// library ID and never infer one.
-func (s *Store) GetScoped(ctx context.Context, libraryID, bookID string) (BookState, map[string]DerivedState, error) {
-	return s.Get(ctx, libraryID, bookID)
-}
-
 // SetBook records the canonical source. It intentionally does not delete
 // derived rows: a failed or partial reconciliation must preserve old evidence.
 func (s *Store) SetBook(ctx context.Context, value BookState) error {
-	if value.LibraryID == "" {
-		return errors.New("library ID is empty")
+	if err := validateStateScope(value.LibraryID, value.BookID); err != nil {
+		return err
 	}
 	if s == nil || s.db == nil {
 		return errors.New("state store is not initialized")
-	}
-	if err := bindBookScope(value.LibraryID, &value); err != nil {
-		return err
 	}
 	if value.UpdatedAt.IsZero() {
 		value.UpdatedAt = time.Now().UTC()
@@ -558,25 +282,14 @@ ON CONFLICT(library_id, book_id) DO UPDATE SET
 	return nil
 }
 
-func (s *Store) SetBookScoped(ctx context.Context, libraryID string, value BookState) error {
-	if value.LibraryID != "" && value.LibraryID != libraryID {
-		return errors.New("book state library ID does not match target")
-	}
-	value.LibraryID = libraryID
-	return s.SetBook(ctx, value)
-}
-
 // SetDerived updates one derivative checkpoint in a transaction. No caller
 // should invoke it until the post-upload GET has found the requested format.
 func (s *Store) SetDerived(ctx context.Context, value DerivedState) error {
-	if value.LibraryID == "" {
-		return errors.New("library ID is empty")
+	if err := validateDerivedState(value); err != nil {
+		return err
 	}
 	if s == nil || s.db == nil {
 		return errors.New("state store is not initialized")
-	}
-	if err := bindDerivedScope(value.LibraryID, &value); err != nil {
-		return err
 	}
 	if value.UpdatedAt.IsZero() {
 		value.UpdatedAt = time.Now().UTC()
@@ -604,14 +317,6 @@ ON CONFLICT(library_id, book_id, format) DO UPDATE SET
 		return fmt.Errorf("commit derived state: %w", err)
 	}
 	return nil
-}
-
-func (s *Store) SetDerivedScoped(ctx context.Context, libraryID string, value DerivedState) error {
-	if value.LibraryID != "" && value.LibraryID != libraryID {
-		return errors.New("derived state library ID does not match target")
-	}
-	value.LibraryID = libraryID
-	return s.SetDerived(ctx, value)
 }
 
 // UpsertPollObservation records the latest observation for an explicit
@@ -668,10 +373,6 @@ ON CONFLICT(library_id, book_id) DO UPDATE SET
 	return value, nil
 }
 
-func (s *Store) UpsertPollObservationScoped(ctx context.Context, libraryID, bookID, fingerprint string, seenAt time.Time) (PollState, error) {
-	return s.UpsertPollObservation(ctx, libraryID, bookID, fingerprint, seenAt)
-}
-
 // ListDuePollStates returns pending and retry states for one library
 // whose next attempt is ready. A zero limit means no limit; a negative limit is
 // rejected. Results are ordered by due time and then book ID for deterministic
@@ -715,10 +416,6 @@ ORDER BY next_attempt_at_ns IS NOT NULL, next_attempt_at_ns, book_id`
 	return result, nil
 }
 
-func (s *Store) ListDuePollStatesScoped(ctx context.Context, libraryID string, now time.Time, limit int) ([]PollState, error) {
-	return s.ListDuePollStates(ctx, libraryID, now, limit)
-}
-
 // MarkPollSuccess applies the observation identified by fingerprint for
 // one library/book pair. The fingerprint guard prevents a stale scheduler
 // worker from marking a newer observation current.
@@ -726,7 +423,7 @@ func (s *Store) MarkPollSuccess(ctx context.Context, libraryID, bookID, fingerpr
 	if s == nil || s.db == nil {
 		return errors.New("state store is not initialized")
 	}
-	if err := validateScopedPollTarget(libraryID, bookID, fingerprint); err != nil {
+	if err := validatePollTarget(libraryID, bookID, fingerprint); err != nil {
 		return err
 	}
 	updatedAt = stateTime(updatedAt)
@@ -751,10 +448,6 @@ WHERE library_id = ? AND book_id = ? AND observation_fingerprint = ? AND status 
 	return nil
 }
 
-func (s *Store) MarkPollSuccessScoped(ctx context.Context, libraryID, bookID, fingerprint string, updatedAt time.Time) error {
-	return s.MarkPollSuccess(ctx, libraryID, bookID, fingerprint, updatedAt)
-}
-
 // RequeuePollObservation leaves an observation immediately due without
 // consuming a conversion attempt. It is used when an operational mutation,
 // such as failure-tag maintenance, could not be committed.
@@ -762,7 +455,7 @@ func (s *Store) RequeuePollObservation(ctx context.Context, libraryID, bookID, f
 	if s == nil || s.db == nil {
 		return errors.New("state store is not initialized")
 	}
-	if err := validateScopedPollTarget(libraryID, bookID, fingerprint); err != nil {
+	if err := validatePollTarget(libraryID, bookID, fingerprint); err != nil {
 		return err
 	}
 	if err := validatePollErrorCode(errorCode); err != nil {
@@ -785,22 +478,16 @@ WHERE library_id = ? AND book_id = ? AND observation_fingerprint = ? AND status 
 	return nil
 }
 
-func (s *Store) RequeuePollObservationScoped(ctx context.Context, libraryID, bookID, fingerprint, errorCode string, nextAttemptAt, updatedAt time.Time) error {
-	return s.RequeuePollObservation(ctx, libraryID, bookID, fingerprint, errorCode, nextAttemptAt, updatedAt)
-}
-
-// RecordPollFailure atomically records one failed attempt. It increments the
-// attempt count and selects retry until maxAttempts is reached, then selects
-// failed. nextAttemptAt is stored only when the resulting state is retry; a
-// zero nextAttemptAt makes that retry immediately due.
-// RecordPollFailure atomically records one failed attempt for an
-// explicit library/book observation. It increments the attempt count and
-// selects retry until maxAttempts is reached, then selects failed.
+// RecordPollFailure atomically records one failed attempt for an explicit
+// library/book observation. It increments the attempt count and selects retry
+// until maxAttempts is reached, then selects failed. nextAttemptAt is stored
+// only when the resulting state is retry; a zero nextAttemptAt makes that
+// retry immediately due.
 func (s *Store) RecordPollFailure(ctx context.Context, libraryID, bookID, fingerprint, errorCode string, nextAttemptAt time.Time, maxAttempts int, updatedAt time.Time) (PollState, error) {
 	if s == nil || s.db == nil {
 		return PollState{}, errors.New("state store is not initialized")
 	}
-	if err := validateScopedPollTarget(libraryID, bookID, fingerprint); err != nil {
+	if err := validatePollTarget(libraryID, bookID, fingerprint); err != nil {
 		return PollState{}, err
 	}
 	if err := validatePollErrorCode(errorCode); err != nil {
@@ -840,28 +527,10 @@ WHERE library_id = ? AND book_id = ? AND observation_fingerprint = ? AND status 
 	return value, nil
 }
 
-func (s *Store) RecordPollFailureScoped(ctx context.Context, libraryID, bookID, fingerprint, errorCode string, nextAttemptAt time.Time, maxAttempts int, updatedAt time.Time) (PollState, error) {
-	return s.RecordPollFailure(ctx, libraryID, bookID, fingerprint, errorCode, nextAttemptAt, maxAttempts, updatedAt)
-}
-
 // MarkPollFailure is the retry-exhausted convenience form of RecordPollFailure.
 func (s *Store) MarkPollFailure(ctx context.Context, libraryID, bookID, fingerprint, errorCode string, updatedAt time.Time) error {
 	_, err := s.RecordPollFailure(ctx, libraryID, bookID, fingerprint, errorCode, time.Time{}, 1, updatedAt)
 	return err
-}
-
-func (s *Store) MarkPollFailureScoped(ctx context.Context, libraryID, bookID, fingerprint, errorCode string, updatedAt time.Time) error {
-	return s.MarkPollFailure(ctx, libraryID, bookID, fingerprint, errorCode, updatedAt)
-}
-
-func validatePollTarget(bookID, fingerprint string) error {
-	if fingerprint == "" {
-		return errors.New("poll observation fingerprint is empty")
-	}
-	if bookID == "" {
-		return errors.New("poll book ID is empty")
-	}
-	return nil
 }
 
 func validateStateScope(libraryID, bookID string) error {
@@ -874,32 +543,17 @@ func validateStateScope(libraryID, bookID string) error {
 	return nil
 }
 
-func bindBookScope(libraryID string, value *BookState) error {
-	if err := validateStateScope(libraryID, value.BookID); err != nil {
-		return err
-	}
-	if value.LibraryID != "" && value.LibraryID != libraryID {
-		return errors.New("book state library ID does not match target")
-	}
-	value.LibraryID = libraryID
-	return nil
-}
-
-func bindDerivedScope(libraryID string, value *DerivedState) error {
-	if err := validateStateScope(libraryID, value.BookID); err != nil {
+func validateDerivedState(value DerivedState) error {
+	if err := validateStateScope(value.LibraryID, value.BookID); err != nil {
 		return err
 	}
 	if value.Format == "" {
 		return errors.New("derived format is empty")
 	}
-	if value.LibraryID != "" && value.LibraryID != libraryID {
-		return errors.New("derived state library ID does not match target")
-	}
-	value.LibraryID = libraryID
 	return nil
 }
 
-func validateScopedPollTarget(libraryID, bookID, fingerprint string) error {
+func validatePollTarget(libraryID, bookID, fingerprint string) error {
 	if err := validateStateScope(libraryID, bookID); err != nil {
 		return err
 	}

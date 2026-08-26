@@ -56,11 +56,8 @@ type Config struct {
 	PollRetryMax          time.Duration
 }
 
-// Load reads the service configuration from the environment. The names in
-// this function are deliberately not runtime switches: the service always
-// uses the deployment-specific Grimmory /api/v1/books/{id}/files endpoint.
 func Load() (Config, error) {
-	port := firstNonEmpty("PORT", "CONVERTER_PORT")
+	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
@@ -68,23 +65,23 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("invalid port %q", port)
 	}
 
-	addr := firstNonEmpty("ADDR", "CONVERTER_ADDR")
+	addr := os.Getenv("ADDR")
 	if addr == "" {
 		addr = ":" + port
 	}
-	dataDir := firstNonEmpty("DATA_DIR", "CONVERTER_DATA_DIR")
+	dataDir := os.Getenv("DATA_DIR")
 	if dataDir == "" {
 		dataDir = "/data"
 	}
-	keyPath := firstNonEmpty("API_KEY_FILE")
+	keyPath := os.Getenv("API_KEY_FILE")
 	if keyPath == "" {
 		keyPath = filepath.Join(dataDir, "api-key")
 	}
-	calibre := firstNonEmpty("CALIBRE_BINARY", "CONVERTER_CALIBRE_BINARY")
+	calibre := os.Getenv("CALIBRE_BINARY")
 	if calibre == "" {
 		calibre = "ebook-convert"
 	}
-	logLevel, err := logging.Parse(firstNonEmpty("LOG_LEVEL", "CONVERTER_LOG_LEVEL"))
+	logLevel, err := logging.Parse(os.Getenv("LOG_LEVEL"))
 	if err != nil {
 		return Config{}, err
 	}
@@ -109,11 +106,11 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	outputs, err := parseFormats("OUTPUT_FORMATS", firstNonEmpty("OUTPUT_FORMATS"), []string{"mobi", "azw3"})
+	outputs, err := parseFormats("OUTPUT_FORMATS", os.Getenv("OUTPUT_FORMATS"), []string{"mobi", "azw3"})
 	if err != nil {
 		return Config{}, err
 	}
-	inputs, err := parseFormats("SUPPORTED_INPUT_FORMATS", firstNonEmpty("SUPPORTED_INPUT_FORMATS"), []string{"epub", "azw3", "mobi"})
+	inputs, err := parseFormats("SUPPORTED_INPUT_FORMATS", os.Getenv("SUPPORTED_INPUT_FORMATS"), []string{"epub", "azw3", "mobi"})
 	if err != nil {
 		return Config{}, err
 	}
@@ -219,26 +216,6 @@ func parseLibraryIDs(value string) ([]string, error) {
 	return result, nil
 }
 
-func contains(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
-}
-
-func parseFormat(name, value, fallback string) (string, error) {
-	if strings.TrimSpace(value) == "" {
-		value = fallback
-	}
-	value = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(value, ".")))
-	if !formatPattern.MatchString(value) || len(value) > maxFormatLength {
-		return "", fmt.Errorf("invalid %s format %q", name, value)
-	}
-	return value, nil
-}
-
 func parseFormats(name, value string, fallback []string) ([]string, error) {
 	if strings.TrimSpace(value) == "" {
 		return append([]string(nil), fallback...), nil
@@ -295,13 +272,4 @@ func boundedDuration(name string, fallback, minimum, maximum time.Duration) (tim
 		return 0, fmt.Errorf("invalid %s %q", name, value)
 	}
 	return parsed, nil
-}
-
-func firstNonEmpty(names ...string) string {
-	for _, name := range names {
-		if value, ok := os.LookupEnv(name); ok && value != "" {
-			return value
-		}
-	}
-	return ""
 }

@@ -35,7 +35,6 @@ var (
 	ErrFailureTagMutation = errors.New("failure tag mutation failed")
 	ErrAmbiguousFile      = errors.New("Grimmory file inventory is ambiguous")
 	ErrPrimaryFile        = errors.New("primary Grimmory file cannot be deleted")
-	ErrDeleteUnsupported  = errors.New("Grimmory file deletion is unsupported")
 )
 
 // ClassifyError returns a bounded, secret-safe category for operational logs.
@@ -99,19 +98,7 @@ type Remote interface {
 	GetLibraryBook(context.Context, string, string) (grimmory.Book, error)
 	DownloadContentScoped(context.Context, grimmory.BookReference, string, io.Writer) (int64, string, error)
 	UploadFileScoped(context.Context, grimmory.BookReference, string, string) error
-}
-
-// NamedUploader is optional so older/manual Remote implementations remain
-// compatible. The deployed Grimmory client implements it to preserve the
-// source-derived output name in the multipart filename.
-type NamedUploader interface {
 	UploadFileNamedScoped(context.Context, grimmory.BookReference, string, string, string) error
-}
-
-// FileDeleter is optional for compatibility with read/create-only Remote
-// implementations. A planned rebuild that has an existing target requires it;
-// reconciliation never falls back to uploading over an existing file.
-type FileDeleter interface {
 	DeleteFileScoped(context.Context, grimmory.BookReference, string) error
 }
 
@@ -1018,10 +1005,7 @@ func sanitizedSourceBasename(sourceName string) string {
 }
 
 func (s *Service) upload(ctx context.Context, reference grimmory.BookReference, format, filePath, sourceName string) error {
-	if named, ok := s.client.(NamedUploader); ok {
-		return named.UploadFileNamedScoped(ctx, reference, format, filePath, desiredOutputName(sourceName, format))
-	}
-	return s.client.UploadFileScoped(ctx, reference, format, filePath)
+	return s.client.UploadFileNamedScoped(ctx, reference, format, filePath, desiredOutputName(sourceName, format))
 }
 
 // prepareDerivativeReplacement takes the destructive step only for a planned
@@ -1069,11 +1053,7 @@ func (s *Service) prepareDerivativeReplacement(ctx context.Context, reference gr
 	if identityMatches != 1 {
 		return grimmory.File{}, false, ErrAmbiguousFile
 	}
-	deleter, ok := s.client.(FileDeleter)
-	if !ok {
-		return grimmory.File{}, false, ErrDeleteUnsupported
-	}
-	if err := deleter.DeleteFileScoped(ctx, reference, existing.ID); err != nil {
+	if err := s.client.DeleteFileScoped(ctx, reference, existing.ID); err != nil {
 		// Another writer can remove the planned target after this inventory read
 		// but before DELETE. In that case the replacement upload is still safe.
 		if missingDerivativeFile(err) {

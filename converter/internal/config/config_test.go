@@ -28,6 +28,27 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLegacyEnvironmentNamesAreIgnored(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("GRIMMORY_BASE_URL", "https://grimmory.example")
+	t.Setenv("GRIMMORY_USERNAME", "user")
+	t.Setenv("GRIMMORY_PASSWORD", "password")
+	t.Setenv("LIBRARY_IDS", "1")
+	t.Setenv("CONVERTER_PORT", "9000")
+	t.Setenv("CONVERTER_ADDR", ":9000")
+	t.Setenv("CONVERTER_DATA_DIR", "/legacy")
+	t.Setenv("CONVERTER_CALIBRE_BINARY", "legacy-converter")
+	t.Setenv("CONVERTER_LOG_LEVEL", "invalid")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Addr != ":8080" || cfg.DataDir != "/data" || cfg.APIKeyPath != "/data/api-key" || cfg.CalibreBinary != "ebook-convert" || cfg.LogLevel != logging.Info {
+		t.Fatalf("legacy environment names changed config = %+v", cfg)
+	}
+}
+
 func TestLibraryAllowlistAndConcurrencyAreValidated(t *testing.T) {
 	clearConfigEnv(t)
 	t.Setenv("GRIMMORY_BASE_URL", "https://grimmory.example")
@@ -143,9 +164,8 @@ func TestBoundedSettingsRejectOutOfRangeValues(t *testing.T) {
 func clearConfigEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
-		"PORT", "CONVERTER_PORT", "ADDR", "CONVERTER_ADDR", "DATA_DIR", "CONVERTER_DATA_DIR",
-		"API_KEY_FILE", "CALIBRE_BINARY", "CONVERTER_CALIBRE_BINARY",
-		"LOG_LEVEL", "CONVERTER_LOG_LEVEL", "GRIMMORY_BASE_URL", "GRIMMORY_USERNAME", "GRIMMORY_PASSWORD",
+		"PORT", "ADDR", "DATA_DIR", "API_KEY_FILE", "CALIBRE_BINARY", "LOG_LEVEL",
+		"GRIMMORY_BASE_URL", "GRIMMORY_USERNAME", "GRIMMORY_PASSWORD",
 		"LIBRARY_IDS", "OUTPUT_FORMATS", "SUPPORTED_INPUT_FORMATS", "IGNORE_PROCESSING_TAG", "FAILED_PROCESSING_TAG", "MAX_CONCURRENT_BOOKS", "MAX_FILE_BYTES", "MAX_RESPONSE_BYTES",
 		"HTTP_TIMEOUT", "CONVERSION_TIMEOUT", "DATABASE_BUSY_TIMEOUT",
 		"POLL_INTERVAL", "POLL_MAX_ATTEMPTS", "POLL_RETRY_BASE", "POLL_RETRY_MAX",

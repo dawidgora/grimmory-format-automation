@@ -162,7 +162,6 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, _ string, syn
 			methodNotAllowed(w, http.MethodGet)
 			return
 		}
-		// DGc: do we need to be that defensive?
 		if s == nil || s.service == nil {
 			writeError(w, http.StatusInternalServerError, "service unavailable")
 			return

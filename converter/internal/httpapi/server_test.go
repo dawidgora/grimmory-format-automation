@@ -33,6 +33,9 @@ func (endpointRemote) UploadFileNamedScoped(context.Context, grimmory.BookRefere
 func (endpointRemote) UploadFileScoped(context.Context, grimmory.BookReference, string, string) error {
 	return nil
 }
+func (endpointRemote) DeleteFileScoped(context.Context, grimmory.BookReference, string) error {
+	return nil
+}
 
 type failingEndpointRemote struct{ err error }
 
@@ -49,6 +52,9 @@ func (failingEndpointRemote) UploadFileNamedScoped(context.Context, grimmory.Boo
 	return nil
 }
 func (failingEndpointRemote) UploadFileScoped(context.Context, grimmory.BookReference, string, string) error {
+	return nil
+}
+func (failingEndpointRemote) DeleteFileScoped(context.Context, grimmory.BookReference, string) error {
 	return nil
 }
 
