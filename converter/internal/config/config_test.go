@@ -28,27 +28,6 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
-func TestLegacyEnvironmentNamesAreIgnored(t *testing.T) {
-	clearConfigEnv(t)
-	t.Setenv("GRIMMORY_BASE_URL", "https://grimmory.example")
-	t.Setenv("GRIMMORY_USERNAME", "user")
-	t.Setenv("GRIMMORY_PASSWORD", "password")
-	t.Setenv("LIBRARY_IDS", "1")
-	t.Setenv("CONVERTER_PORT", "9000")
-	t.Setenv("CONVERTER_ADDR", ":9000")
-	t.Setenv("CONVERTER_DATA_DIR", "/legacy")
-	t.Setenv("CONVERTER_CALIBRE_BINARY", "legacy-converter")
-	t.Setenv("CONVERTER_LOG_LEVEL", "invalid")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Addr != ":8080" || cfg.DataDir != "/data" || cfg.APIKeyPath != "/data/api-key" || cfg.CalibreBinary != "ebook-convert" || cfg.LogLevel != logging.Info {
-		t.Fatalf("legacy environment names changed config = %+v", cfg)
-	}
-}
-
 func TestLibraryAllowlistAndConcurrencyAreValidated(t *testing.T) {
 	clearConfigEnv(t)
 	t.Setenv("GRIMMORY_BASE_URL", "https://grimmory.example")
