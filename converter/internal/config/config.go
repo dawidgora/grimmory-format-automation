@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -33,7 +32,6 @@ var formatPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9+_-]{0,31}$`)
 type Config struct {
 	Addr                  string
 	DataDir               string
-	APIKeyPath            string
 	CalibreBinary         string
 	LogLevel              logging.Level
 	GrimmoryBaseURL       string
@@ -72,10 +70,6 @@ func Load() (Config, error) {
 	dataDir := os.Getenv("DATA_DIR")
 	if dataDir == "" {
 		dataDir = "/data"
-	}
-	keyPath := os.Getenv("API_KEY_FILE")
-	if keyPath == "" {
-		keyPath = filepath.Join(dataDir, "api-key")
 	}
 	calibre := os.Getenv("CALIBRE_BINARY")
 	if calibre == "" {
@@ -164,7 +158,6 @@ func Load() (Config, error) {
 	return Config{
 		Addr:                  addr,
 		DataDir:               dataDir,
-		APIKeyPath:            keyPath,
 		CalibreBinary:         calibre,
 		LogLevel:              logLevel,
 		GrimmoryBaseURL:       baseURL,

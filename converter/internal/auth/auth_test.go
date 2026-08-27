@@ -25,13 +25,14 @@ func TestAuthenticatorBearer(t *testing.T) {
 }
 
 func TestLoadOrCreateEnvironmentPrecedesPersistedKey(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "api-key")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "api-key")
 	if err := os.WriteFile(path, []byte("persisted"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("API_KEY", "from-environment")
 
-	key, generated, err := LoadOrCreate(path)
+	key, generated, err := LoadOrCreate(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,8 +43,9 @@ func TestLoadOrCreateEnvironmentPrecedesPersistedKey(t *testing.T) {
 
 func TestLoadOrCreateGeneratesRestrictedKey(t *testing.T) {
 	unsetEnv(t, "API_KEY")
-	path := filepath.Join(t.TempDir(), "nested", "api-key")
-	key, generated, err := LoadOrCreate(path)
+	dir := filepath.Join(t.TempDir(), "nested")
+	path := filepath.Join(dir, "api-key")
+	key, generated, err := LoadOrCreate(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +59,7 @@ func TestLoadOrCreateGeneratesRestrictedKey(t *testing.T) {
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("key mode = %o, want 600", got)
 	}
-	loaded, generated, err := LoadOrCreate(path)
+	loaded, generated, err := LoadOrCreate(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +79,7 @@ func TestLoadOrCreateRejectsSymlink(t *testing.T) {
 	if err := os.Symlink(target, path); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	if _, _, err := LoadOrCreate(path); err == nil {
+	if _, _, err := LoadOrCreate(dir); err == nil {
 		t.Fatal("expected symlink error")
 	}
 }

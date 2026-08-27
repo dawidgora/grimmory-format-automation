@@ -13,23 +13,19 @@ import (
 
 var errEmptyAPIKey = errors.New("api key is empty")
 
-// LoadOrCreate loads the key from the environment when configured, otherwise
-// from path. If neither exists, it creates a random key with private file
-// permissions. generated is true only when a new key was persisted.
-func LoadOrCreate(path string) (key string, generated bool, err error) {
-	for _, name := range []string{"API_KEY"} {
-		if value, present := os.LookupEnv(name); present {
-			value = strings.TrimSpace(value)
-			if value == "" {
-				return "", false, fmt.Errorf("%s: %w", name, errEmptyAPIKey)
-			}
-			return value, false, nil
+// LoadOrCreate returns API_KEY when configured. Otherwise it loads the
+// generated key from dataDir/api-key or creates and persists one with private
+// file permissions. generated is true only when a new key was persisted.
+func LoadOrCreate(dataDir string) (key string, generated bool, err error) {
+	if value, present := os.LookupEnv("API_KEY"); present {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return "", false, fmt.Errorf("API_KEY: %w", errEmptyAPIKey)
 		}
+		return value, false, nil
 	}
 
-	if path == "" {
-		return "", false, errors.New("api key path is empty")
-	}
+	path := filepath.Join(dataDir, "api-key")
 	if info, statErr := os.Lstat(path); statErr == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return "", false, errors.New("api key file must not be a symlink")

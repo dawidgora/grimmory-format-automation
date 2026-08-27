@@ -10,9 +10,8 @@ services:
     restart: unless-stopped
     init: true
     environment:
-      # Leave both variables unset to generate /data/api-key on first start.
+      # Leave API_KEY unset to generate /data/api-key on first start.
       - API_KEY
-      - API_KEY_FILE
       - CONVERTER_LOG_LEVEL
       - LOG_LEVEL
       # These values are required by the sync implementation. Keep them

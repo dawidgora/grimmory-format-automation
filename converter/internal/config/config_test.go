@@ -17,7 +17,7 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Addr != ":8080" || cfg.DataDir != "/data" || cfg.APIKeyPath != "/data/api-key" || cfg.CalibreBinary != "ebook-convert" || cfg.LogLevel != logging.Info {
+	if cfg.Addr != ":8080" || cfg.DataDir != "/data" || cfg.CalibreBinary != "ebook-convert" || cfg.LogLevel != logging.Info {
 		t.Fatalf("defaults = %+v", cfg)
 	}
 	if join(cfg.LibraryIDs) != "1,2" || join(cfg.OutputFormats) != "mobi,azw3" || join(cfg.SupportedInputFormats) != "epub,azw3,mobi" || cfg.MaxConcurrentBooks != 1 {
@@ -143,7 +143,7 @@ func TestBoundedSettingsRejectOutOfRangeValues(t *testing.T) {
 func clearConfigEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
-		"PORT", "ADDR", "DATA_DIR", "API_KEY_FILE", "CALIBRE_BINARY", "LOG_LEVEL",
+		"PORT", "ADDR", "DATA_DIR", "CALIBRE_BINARY", "LOG_LEVEL",
 		"GRIMMORY_BASE_URL", "GRIMMORY_USERNAME", "GRIMMORY_PASSWORD",
 		"LIBRARY_IDS", "OUTPUT_FORMATS", "SUPPORTED_INPUT_FORMATS", "IGNORE_PROCESSING_TAG", "FAILED_PROCESSING_TAG", "MAX_CONCURRENT_BOOKS", "MAX_FILE_BYTES", "MAX_RESPONSE_BYTES",
 		"HTTP_TIMEOUT", "CONVERSION_TIMEOUT", "DATABASE_BUSY_TIMEOUT",

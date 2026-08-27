@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -38,13 +39,13 @@ func main() {
 		log.Fatal(err)
 	}
 	logger := logging.New(cfg.LogLevel, os.Stderr)
-	apiKey, generated, err := auth.LoadOrCreate(cfg.APIKeyPath)
+	apiKey, generated, err := auth.LoadOrCreate(cfg.DataDir)
 	if err != nil {
 		log.Fatal(err)
 	}
 	if generated {
 		// Never log the credential.
-		logger.Log(logging.Info, logging.Field{Key: "message", Value: "generated API key"}, logging.Field{Key: "path", Value: cfg.APIKeyPath})
+		logger.Log(logging.Info, logging.Field{Key: "message", Value: "generated API key"}, logging.Field{Key: "path", Value: filepath.Join(cfg.DataDir, "api-key")})
 	}
 
 	store, err := state.Open(cfg.DataDir, cfg.DatabaseBusyTimeout)

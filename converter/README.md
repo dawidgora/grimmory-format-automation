@@ -10,9 +10,9 @@ manual-only. Polling performs an immediate scan and uses a start-to-start
 ticker; ticks during a running scan are discarded.
 
 Required Grimmory settings are `GRIMMORY_BASE_URL`, `GRIMMORY_USERNAME`, and
-`GRIMMORY_PASSWORD`. `API_KEY` takes precedence over `$DATA_DIR/api-key`; when
-neither exists a random key is generated and persisted with mode `0600`.
-`DATA_DIR` defaults to `/data` and contains only `api-key` and `state.db`.
+`GRIMMORY_PASSWORD`. `API_KEY` is optional; when unset, a random key is loaded
+from or generated at `$DATA_DIR/api-key` with mode `0600`. `DATA_DIR` defaults
+to `/data` and contains only `api-key` and `state.db`.
 
 `LIBRARY_IDS` is required and is a comma-separated integer allowlist. Format
 settings are `OUTPUT_FORMATS` (default `mobi,azw3`) and
