@@ -504,7 +504,7 @@ func TestSchedulerRetriesTransientThenExhaustsRetries(t *testing.T) {
 	}
 }
 
-func TestSchedulerMarksPostUploadObservationCurrent(t *testing.T) {
+func TestSchedulerLeavesPostUploadObservationPending(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	before, after := testBook(), testBook()
 	after.Files = append(after.Files, grimmory.File{ID: "mobi-id", Name: "book.mobi", Format: "mobi"})
@@ -518,9 +518,37 @@ func TestSchedulerMarksPostUploadObservationCurrent(t *testing.T) {
 	store.mu.Lock()
 	value := store.states[before.ID]
 	store.mu.Unlock()
-	want := grimmory.ObservationFingerprint(after)
-	if value.Status != state.PollStatusCurrent || value.AppliedFingerprint != want || len(reconciler.calls) != 1 {
+	beforeFingerprint := grimmory.ObservationFingerprint(before)
+	afterFingerprint := grimmory.ObservationFingerprint(after)
+	if value.Status != state.PollStatusPending || value.ObservationFingerprint != afterFingerprint || value.AppliedFingerprint != beforeFingerprint || len(reconciler.calls) != 1 {
 		t.Fatalf("post-upload state = %+v calls=%v", value, reconciler.calls)
+	}
+}
+
+func TestSchedulerMarksOnlyOriginalObservationSuccessfulAfterConcurrentChange(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	before, after := testBook(), testBook()
+	after.Metadata.Title = "Book changed while syncing"
+	remote := &fakeRemote{detail: []grimmory.Book{after}}
+	store := &memoryStore{}
+	reconciler := &fakeReconciler{}
+	scheduler := newTestScheduler(t, remote, store, reconciler, &now)
+	originalFingerprint := grimmory.ObservationFingerprint(before)
+	postFingerprint := grimmory.ObservationFingerprint(after)
+	pollState, err := store.UpsertPollObservation(context.Background(), "1", before.ID, originalFingerprint, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := scheduler.process(context.Background(), pollState); err != nil {
+		t.Fatal(err)
+	}
+
+	store.mu.Lock()
+	value := store.states[before.ID]
+	store.mu.Unlock()
+	if value.Status != state.PollStatusPending || value.ObservationFingerprint != postFingerprint || value.AppliedFingerprint != originalFingerprint {
+		t.Fatalf("concurrent observation state = %+v", value)
 	}
 }
 

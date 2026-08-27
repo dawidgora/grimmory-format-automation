@@ -38,9 +38,8 @@ endpoints remain available.
 
 ## Manual sync
 
-Start the local Air development service and obtain its key. The default Compose
-workflow is non-polling; it keeps the Go source mounted and reloads it when Go
-files change:
+Start the local Compose service and obtain its key. The default Compose
+workflow is non-polling:
 
 ```sh
 # Provide these three values from a local ignored environment or a secret
@@ -75,8 +74,8 @@ http POST "${SERVICE_URL}/sync/LIBRARY_ID/BOOK_ID?dryRun=false&force=false" \
   "Authorization:Bearer ${API_KEY}"
 ```
 
-The service key is separate from any Grimmory credential. With no explicit
-key, the service generates a random key once and stores it as
+The service key is separate from any Grimmory credential. With `API_KEY` unset
+or blank, the service generates a random key once and stores it as
 `/data/api-key` with mode `0600`. Keep the `/data` volume/PVC across upgrades;
 losing it loses a generated key and requires a key rotation. An explicit
 `API_KEY` is not written to the volume. Treat it as a password: inject it through an ignored local
@@ -146,38 +145,50 @@ Each request is a single-book reconciliation. The deterministic policy is:
    Never discover input by walking a local directory.
 3. Download the canonical source (or download and first convert the selected
    fallback source when the canonical file is missing) and compute the
-   canonical SHA-256. For each configured output, plan `create` when missing,
-   `rebuild` when forced, when the canonical source was just created, when the
-   saved source hash differs, state is absent or incomplete, or when both
+   canonical SHA-256. For each configured output, plan `create` when missing
+   and `rebuild` when forced, when the canonical source was just created, when
+   the saved source hash differs, state is absent or incomplete, or when both
    canonical and target mtimes are trusted and the target is older. A matching
-   fully tracked target is `unchanged`. `dryRun` returns
-   this plan without writing; `force` is the explicit overwrite override.
-4. For every planned output, invoke Calibre in a private temporary directory,
-   hash and size-check the result, and upload only a complete validated file.
-   Never delete the source. When creating a missing main from a configured
-   output format, that existing output is rebuilt from the new canonical main.
-5. Verify each upload by reading Grimmory again and confirming the requested
-   format exists and changed identity or matching remote hash proves the upload.
-   Only then commit the source SHA-256, output SHA-256, target
-   format, trusted modification time, and timestamp. Conversion, download,
+   fully tracked target is `unchanged`. Because the deployment has no atomic
+   replace operation, every rebuild of an existing derivative is reported as
+   `blocked` with `safe_replacement_unavailable`; it is never deleted or
+   overwritten. `dryRun` reports the same blocked rebuild plans without
+   writing, while missing derivatives remain creatable.
+4. For every planned missing output, invoke Calibre in a private temporary
+   directory, hash and size-check the result, and upload only a complete
+   validated file. Never delete the source or an existing derivative. When
+   creating a missing main from a configured output format, any existing
+   derivative is reported as blocked rather than replaced.
+5. Before each upload, persist a derived-upload intent containing the exact
+   source hash, output hash, generation fingerprint, and desired name. Verify
+   the upload by reading Grimmory again and confirming the requested format
+   exists and changed identity or matching remote hash proves the upload. Only
+   then commit the derivative and clear its intent in one transaction. If a
+   retry sees an existing target, it may adopt it only when the current intent,
+   expected name, exact output hash, and a single stable inventory candidate all
+   match; arbitrary remote files are never adopted. Conversion, download,
    upload, verification, and state failures are reported per item; a request
    with any derivative failure is `partial`, and partial output is never marked
    current.
 
 The state database is `/data/state.db`, opened with the pure-Go
 `modernc.org/sqlite` driver. It uses `PRAGMA journal_mode=WAL`, foreign-key
-checks, a single database connection, and a busy timeout. It has three tables:
+checks, a single database connection, and a busy timeout. It has four tables:
 `book_state` is keyed by `(library_id, book_id)` and stores `main_format`,
 `canonical_format`, canonical file ID/name, `canonical_sha256`, metadata
 fingerprint, an optional trusted canonical mtime, last-success timestamp, and
 `updated_at_ns`; `derived` is keyed by `(library_id, book_id, format)` and stores the
 uploaded Grimmory file ID, `source_sha256`, `output_sha256`, an optional
 target-aware generation fingerprint, optional trusted target mtime, generation
-timestamp, and `updated_at_ns`. Derived rows are retained when the canonical source changes
-or a later operation fails, so the previous evidence is not discarded. A
-transaction records a derived row only after the post-upload read confirms the
-requested target. SQLite state is not a substitute for multi-replica
-distributed locking; the service is therefore deployed with one replica.
+timestamp, and `updated_at_ns`. `derived_upload_intent` is keyed by the same
+scope and format and retains the exact desired output name, source hash,
+output hash, and generation fingerprint until the matching derived row is
+committed. Derived rows are retained when the canonical source changes or a
+later operation fails, so the previous evidence is not discarded. A
+transaction records a derived row and clears its intent only after the
+post-upload read confirms the requested target. SQLite state is not a
+substitute for multi-replica distributed locking; the service is therefore
+deployed with one replica.
 
 With `--poll`, the service lists each configured library through its library
 endpoint, gets each book's scoped detail, and persists its stable observation.
@@ -219,8 +230,7 @@ book and its metadata before broad use.
 
 Compose runs only `grimmory-format-service` and publishes port `8080`.
 
-The default workflow is Air-based, non-polling development with isolated
-`converter_dev_data` state:
+The default workflow is non-polling:
 
 ```sh
 docker compose up --build
@@ -246,10 +256,9 @@ Grimmory API contract and credentials before starting it. To inspect behavior
 without writes, use the manual endpoint's `dryRun=true`; the polling workflow
 itself is not a dry-run mode.
 
-The development image is built with the pinned Air tool, mounts `converter/`,
-and rebuilds/restarts the server when Go files change. Re-run the command after
-changing `go.mod` or `go.sum` so the development image refreshes its module
-cache.
+The Compose image runs the compiled service with Calibre and persists its
+state in the named `/data` volume. The polling Compose workflow uses the same
+image with `--poll` enabled.
 
 Do not publish the service directly to an untrusted network. Set an explicit
 `API_KEY` through a local ignored environment or use the generated

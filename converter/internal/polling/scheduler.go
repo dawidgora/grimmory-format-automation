@@ -474,7 +474,10 @@ func (s *Scheduler) processLocked(ctx context.Context, pollState state.PollState
 		return err
 	}
 	postFingerprint := grimmory.ObservationFingerprintIgnoringTags(postBook, s.ignoreTag, s.failedTag)
-	if _, err := s.store.UpsertPollObservation(ctx, pollState.LibraryID, pollState.BookID, postFingerprint, s.now()); err != nil {
+	// Complete only the observation this worker reconciled. Recording the
+	// post-sync observation afterward keeps a distinct concurrent observation
+	// pending for a later pass.
+	if err := s.store.MarkPollSuccess(ctx, pollState.LibraryID, pollState.BookID, pollState.ObservationFingerprint, s.now()); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -484,7 +487,7 @@ func (s *Scheduler) processLocked(ctx context.Context, pollState state.PollState
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := s.store.MarkPollSuccess(ctx, pollState.LibraryID, pollState.BookID, postFingerprint, s.now()); err != nil {
+	if _, err := s.store.UpsertPollObservation(ctx, pollState.LibraryID, pollState.BookID, postFingerprint, s.now()); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}

@@ -48,8 +48,17 @@ visibility failures.
 The poller cannot detect a source change that produces no observable Grimmory
 API change: it does not perform byte-only source change detection.
 
-An existing configured derivative is rebuilt when its checkpoint is missing or
-incomplete; unknown or untracked files are never silently treated as current.
+An existing configured derivative whose checkpoint is missing, incomplete, or
+stale is reported as a blocked rebuild with the stable
+`safe_replacement_unavailable` code. The service has no atomic replace
+operation, so it never deletes or overwrites an existing derivative. Missing
+derivatives are still created; unknown or untracked files are never silently
+treated as current. Before a missing-target upload, SQLite records its exact
+source hash, output hash, generation fingerprint, and desired name. A retry
+adopts an existing target only when one stable remote candidate matches every
+intent field, including its exact output hash; otherwise it remains blocked.
+The intent is cleared atomically with the confirmed derived state. Dry runs
+report the same blocked rebuild plan.
 
 `state.db` is a pure-Go `modernc.org/sqlite` database configured with WAL,
 foreign keys, and a busy timeout. Temporary downloads and Calibre outputs are

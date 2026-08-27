@@ -126,7 +126,7 @@ func (entry *syncLog) fields() []logging.Field {
 
 func safeResultCode(value string) string {
 	switch value {
-	case "invalid_library_id", "library_not_allowed", "library_policy_failed", "invalid_book_id", "service_not_initialized", "get_book_failed", "state_read_failed", "no_source", "workspace_failed", "download_main_failed", "canonical_hash_mismatch", "state_write_failed", "derivative_failed", "download_source_failed", "source_hash_mismatch", "main_conversion_failed", "main_hash_failed", "main_upload_failed", "verification_failed", "failure_tag_failed", "invalid_dry_run", "invalid_force", "service_unavailable", "unauthorized", "method_not_allowed", "request_failed":
+	case "invalid_library_id", "library_not_allowed", "library_policy_failed", "invalid_book_id", "service_not_initialized", "get_book_failed", "state_read_failed", "no_source", "workspace_failed", "download_main_failed", "canonical_hash_mismatch", "state_write_failed", "derivative_failed", reconcile.SafeReplacementUnavailableCode, "download_source_failed", "source_hash_mismatch", "main_conversion_failed", "main_hash_failed", "main_upload_failed", "verification_failed", "failure_tag_failed", "invalid_dry_run", "invalid_force", "service_unavailable", "unauthorized", "method_not_allowed", "request_failed":
 		return value
 	default:
 		return ""
@@ -284,7 +284,11 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request, syncEntry *s
 		if syncEntry.cause == "reconciliation" && result.Error == "verification_failed" {
 			syncEntry.cause = "invalid_response"
 		}
-		writeJSON(w, statusFor(syncErr), result)
+		status := statusFor(syncErr)
+		if result.Error == reconcile.SafeReplacementUnavailableCode {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, result)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -329,6 +333,8 @@ func statusFor(err error) int {
 		return http.StatusForbidden
 	case errors.Is(err, reconcile.ErrNoSource):
 		return http.StatusUnprocessableEntity
+	case errors.Is(err, reconcile.ErrSafeReplacementUnavailable):
+		return http.StatusConflict
 	case errors.Is(err, grimmory.ErrNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, reconcile.ErrState):

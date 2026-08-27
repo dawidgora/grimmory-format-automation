@@ -6,11 +6,10 @@ services:
         VERSION: ${VERSION:-dev}
         VCS_REF: ${VCS_REF:-local}
     image: ${CONVERTER_IMAGE:-grimmory-format-automation:local}
-    command: ["--poll"]
     restart: unless-stopped
     init: true
     environment:
-      # Leave API_KEY unset to generate /data/api-key on first start.
+      # Leave API_KEY unset or blank to generate /data/api-key on first start.
       - API_KEY
       - CONVERTER_LOG_LEVEL
       - LOG_LEVEL

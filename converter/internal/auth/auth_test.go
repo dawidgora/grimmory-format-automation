@@ -41,6 +41,27 @@ func TestLoadOrCreateEnvironmentPrecedesPersistedKey(t *testing.T) {
 	}
 }
 
+func TestLoadOrCreateBlankEnvironmentUsesPersistedKeyOrGenerates(t *testing.T) {
+	t.Setenv("API_KEY", " ")
+	dir := filepath.Join(t.TempDir(), "nested")
+
+	key, generated, err := LoadOrCreate(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key == "" || !generated {
+		t.Fatalf("unexpected generated key %q generated=%v", key, generated)
+	}
+
+	loaded, generated, err := LoadOrCreate(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded != key || generated {
+		t.Fatalf("reload got key %q generated=%v", loaded, generated)
+	}
+}
+
 func TestLoadOrCreateGeneratesRestrictedKey(t *testing.T) {
 	unsetEnv(t, "API_KEY")
 	dir := filepath.Join(t.TempDir(), "nested")

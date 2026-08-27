@@ -64,7 +64,13 @@ type endpointStore struct{}
 func (endpointStore) Get(context.Context, string, string) (state.BookState, map[string]state.DerivedState, error) {
 	return state.BookState{}, map[string]state.DerivedState{}, nil
 }
-func (endpointStore) SetBook(context.Context, state.BookState) error       { return nil }
+func (endpointStore) GetDerivedUploadIntents(context.Context, string, string) (map[string]state.DerivedUploadIntent, error) {
+	return map[string]state.DerivedUploadIntent{}, nil
+}
+func (endpointStore) SetBook(context.Context, state.BookState) error { return nil }
+func (endpointStore) SetDerivedUploadIntent(context.Context, state.DerivedUploadIntent) error {
+	return nil
+}
 func (endpointStore) SetDerived(context.Context, state.DerivedState) error { return nil }
 
 type endpointConverter struct{}
@@ -91,6 +97,22 @@ func endpointServerWithLogger(t *testing.T, remote reconcile.Remote, logger *log
 		ConversionTimeout:  10 * time.Minute,
 	})
 	return NewWithLogger("secret", service, logger)
+}
+
+func blockedEndpointServer(t *testing.T) *Server {
+	t.Helper()
+	service := reconcile.New(reconcile.Options{
+		Client:             endpointRemote{},
+		Store:              endpointStore{},
+		Converter:          endpointConverter{},
+		LibraryIDs:         []string{"1"},
+		OutputFormats:      []string{"mobi"},
+		SupportedInputs:    []string{"epub", "mobi"},
+		MaxConcurrentBooks: 1,
+		MaxFileBytes:       1 << 20,
+		ConversionTimeout:  10 * time.Minute,
+	})
+	return NewWithLogger("secret", service, logging.New(logging.Info, io.Discard))
 }
 
 func TestSuccessfulHealthIsNotAccessLogged(t *testing.T) {
@@ -189,6 +211,22 @@ func TestFormatsAndSyncDryRunAndRouteRemoval(t *testing.T) {
 		if response.Code != http.StatusNotFound {
 			t.Errorf("%s status = %d, want 404", path, response.Code)
 		}
+	}
+}
+
+func TestLiveBlockedRebuildReturnsConflict(t *testing.T) {
+	server := blockedEndpointServer(t)
+	request := httptest.NewRequest(http.MethodPost, "/sync/1/book-1?force=true", nil)
+	request.Header.Set("Authorization", "Bearer secret")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+
+	if response.Code != http.StatusConflict {
+		t.Fatalf("blocked sync status = %d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, `"status":"partial"`) || !strings.Contains(body, `"error":"safe_replacement_unavailable"`) {
+		t.Fatalf("blocked sync body = %s", body)
 	}
 }
 

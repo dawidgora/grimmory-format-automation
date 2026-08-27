@@ -13,16 +13,16 @@ import (
 
 var errEmptyAPIKey = errors.New("api key is empty")
 
-// LoadOrCreate returns API_KEY when configured. Otherwise it loads the
-// generated key from dataDir/api-key or creates and persists one with private
-// file permissions. generated is true only when a new key was persisted.
+// LoadOrCreate returns API_KEY when configured and non-empty. Otherwise it
+// loads the generated key from dataDir/api-key or creates and persists one
+// with private file permissions. generated is true only when a new key was
+// persisted.
 func LoadOrCreate(dataDir string) (key string, generated bool, err error) {
 	if value, present := os.LookupEnv("API_KEY"); present {
 		value = strings.TrimSpace(value)
-		if value == "" {
-			return "", false, fmt.Errorf("API_KEY: %w", errEmptyAPIKey)
+		if value != "" {
+			return value, false, nil
 		}
-		return value, false, nil
 	}
 
 	path := filepath.Join(dataDir, "api-key")

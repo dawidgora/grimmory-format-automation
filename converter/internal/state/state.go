@@ -43,6 +43,18 @@ CREATE TABLE IF NOT EXISTS derived (
     PRIMARY KEY (library_id, book_id, format),
     FOREIGN KEY (library_id, book_id) REFERENCES book_state(library_id, book_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS derived_upload_intent (
+    library_id TEXT NOT NULL,
+    book_id TEXT NOT NULL,
+    format TEXT NOT NULL,
+    output_name TEXT NOT NULL,
+    output_sha256 TEXT NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    generation_fingerprint TEXT NOT NULL,
+    updated_at_ns INTEGER NOT NULL,
+    PRIMARY KEY (library_id, book_id, format),
+    FOREIGN KEY (library_id, book_id) REFERENCES book_state(library_id, book_id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS poll_state (
     library_id TEXT NOT NULL,
     book_id TEXT NOT NULL,
@@ -100,6 +112,21 @@ type DerivedState struct {
 	TrustedMTime          time.Time
 	HasMTime              bool
 	GeneratedAt           time.Time
+	UpdatedAt             time.Time
+}
+
+// DerivedUploadIntent records the exact artifact a reconciliation is about to
+// upload. It remains durable until SetDerived confirms ownership, allowing a
+// later reconciliation to adopt an upload whose state write or visibility
+// check failed.
+type DerivedUploadIntent struct {
+	LibraryID             string
+	BookID                string
+	Format                string
+	OutputName            string
+	OutputSHA256          string
+	SourceSHA256          string
+	GenerationFingerprint string
 	UpdatedAt             time.Time
 }
 
@@ -282,6 +309,66 @@ ON CONFLICT(library_id, book_id) DO UPDATE SET
 	return nil
 }
 
+// GetDerivedUploadIntents returns durable upload intents for one book.
+func (s *Store) GetDerivedUploadIntents(ctx context.Context, libraryID, bookID string) (map[string]DerivedUploadIntent, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("state store is not initialized")
+	}
+	if err := validateStateScope(libraryID, bookID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT library_id, book_id, format, output_name, output_sha256, source_sha256, generation_fingerprint, updated_at_ns FROM derived_upload_intent WHERE library_id = ? AND book_id = ?`, libraryID, bookID)
+	if err != nil {
+		return nil, fmt.Errorf("read derived upload intents: %w", err)
+	}
+	defer rows.Close()
+	result := make(map[string]DerivedUploadIntent)
+	for rows.Next() {
+		var value DerivedUploadIntent
+		var generationFingerprint sql.NullString
+		var updatedAt sql.NullInt64
+		if err := rows.Scan(&value.LibraryID, &value.BookID, &value.Format, &value.OutputName, &value.OutputSHA256, &value.SourceSHA256, &generationFingerprint, &updatedAt); err != nil {
+			return nil, fmt.Errorf("scan derived upload intent: %w", err)
+		}
+		value.GenerationFingerprint = generationFingerprint.String
+		value.UpdatedAt, _ = fromNS(updatedAt)
+		result[value.Format] = value
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read derived upload intents: %w", err)
+	}
+	return result, nil
+}
+
+// SetDerivedUploadIntent persists the exact artifact identity before an upload.
+// It is intentionally separate from SetDerived so a failed upload or
+// verification leaves the intent available for recovery.
+func (s *Store) SetDerivedUploadIntent(ctx context.Context, value DerivedUploadIntent) error {
+	if err := validateDerivedUploadIntent(value); err != nil {
+		return err
+	}
+	if s == nil || s.db == nil {
+		return errors.New("state store is not initialized")
+	}
+	if value.UpdatedAt.IsZero() {
+		value.UpdatedAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO derived_upload_intent (library_id, book_id, format, output_name, output_sha256, source_sha256, generation_fingerprint, updated_at_ns)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(library_id, book_id, format) DO UPDATE SET
+ output_name=excluded.output_name,
+ output_sha256=excluded.output_sha256,
+ source_sha256=excluded.source_sha256,
+ generation_fingerprint=excluded.generation_fingerprint,
+ updated_at_ns=excluded.updated_at_ns`,
+		value.LibraryID, value.BookID, value.Format, value.OutputName, value.OutputSHA256, value.SourceSHA256, nullableString(value.GenerationFingerprint), value.UpdatedAt.UnixNano())
+	if err != nil {
+		return fmt.Errorf("write derived upload intent: %w", err)
+	}
+	return nil
+}
+
 // SetDerived updates one derivative checkpoint in a transaction. No caller
 // should invoke it until the post-upload GET has found the requested format.
 func (s *Store) SetDerived(ctx context.Context, value DerivedState) error {
@@ -312,6 +399,9 @@ ON CONFLICT(library_id, book_id, format) DO UPDATE SET
  updated_at_ns=excluded.updated_at_ns`,
 		value.LibraryID, value.BookID, value.Format, nullableString(value.GrimmoryFileID), value.SourceSHA256, value.OutputSHA256, nullableString(value.GenerationFingerprint), toNS(value.TrustedMTime, value.HasMTime), toNS(value.GeneratedAt, !value.GeneratedAt.IsZero()), value.UpdatedAt.UnixNano()); err != nil {
 		return fmt.Errorf("write derived state: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM derived_upload_intent WHERE library_id = ? AND book_id = ? AND format = ?`, value.LibraryID, value.BookID, value.Format); err != nil {
+		return fmt.Errorf("clear derived upload intent: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit derived state: %w", err)
@@ -549,6 +639,28 @@ func validateDerivedState(value DerivedState) error {
 	}
 	if value.Format == "" {
 		return errors.New("derived format is empty")
+	}
+	return nil
+}
+
+func validateDerivedUploadIntent(value DerivedUploadIntent) error {
+	if err := validateStateScope(value.LibraryID, value.BookID); err != nil {
+		return err
+	}
+	if value.Format == "" {
+		return errors.New("derived upload intent format is empty")
+	}
+	if value.OutputName == "" {
+		return errors.New("derived upload intent output name is empty")
+	}
+	if value.OutputSHA256 == "" {
+		return errors.New("derived upload intent output hash is empty")
+	}
+	if value.SourceSHA256 == "" {
+		return errors.New("derived upload intent source hash is empty")
+	}
+	if value.GenerationFingerprint == "" {
+		return errors.New("derived upload intent generation fingerprint is empty")
 	}
 	return nil
 }

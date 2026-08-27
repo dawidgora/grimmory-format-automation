@@ -249,8 +249,9 @@ func TestClientLibraryResponseIsBounded(t *testing.T) {
 	}
 }
 
-func TestClientBookTagMutationPreservesMetadataAndIsIdempotent(t *testing.T) {
+func TestClientBookTagMutationUsesTagPatchAndIsIdempotent(t *testing.T) {
 	currentTags := []string{"keep", "keep"}
+	description := "Description"
 	var putCount, getCount, membershipCount int
 	var updatedPayload map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -274,7 +275,7 @@ func TestClientBookTagMutationPreservesMetadataAndIsIdempotent(t *testing.T) {
 				"customField": "preserve", "tags": currentTags,
 			}
 			if withDescription {
-				metadata["description"] = "Description"
+				metadata["description"] = description
 			}
 			writeJSON(w, map[string]any{
 				"id": "book-1", "libraryId": "library-1",
@@ -285,6 +286,9 @@ func TestClientBookTagMutationPreservesMetadataAndIsIdempotent(t *testing.T) {
 			if r.Method != http.MethodPut {
 				t.Errorf("metadata endpoint method = %s", r.Method)
 				return
+			}
+			if r.URL.Query().Get("replaceMode") != "REPLACE_WHEN_PROVIDED" || len(r.URL.Query()) != 1 {
+				t.Errorf("metadata update query = %q", r.URL.RawQuery)
 			}
 			putCount++
 			if err := json.NewDecoder(r.Body).Decode(&updatedPayload); err != nil {
@@ -304,11 +308,17 @@ func TestClientBookTagMutationPreservesMetadataAndIsIdempotent(t *testing.T) {
 						currentTags = append(currentTags, value.(string))
 					}
 				}
+				if value, exists := metadata["description"]; exists {
+					description = value.(string)
+				}
 			}
 			writeJSON(w, map[string]any{"ok": true})
 			return
 		case "/api/v1/libraries/library-1/book/book-1":
 			membershipCount++
+			if membershipCount == 2 {
+				description = "Concurrent description"
+			}
 			writeJSON(w, map[string]any{"id": "book-1", "libraryId": "library-1", "metadata": map[string]any{"title": "Book"}, "files": []any{}})
 		default:
 			http.NotFound(w, r)
@@ -326,18 +336,21 @@ func TestClientBookTagMutationPreservesMetadataAndIsIdempotent(t *testing.T) {
 	if putCount != 1 || !reflect.DeepEqual(currentTags, []string{"keep", "new"}) {
 		t.Fatalf("add tags=%v puts=%d", currentTags, putCount)
 	}
-	metadata, ok := updatedPayload["metadata"].(map[string]any)
-	if !ok || metadata["customField"] != "preserve" || metadata["title"] != "Book" || metadata["description"] != "Description" {
-		t.Fatalf("metadata snapshot was not preserved: %#v", updatedPayload)
+	if description != "Concurrent description" {
+		t.Fatalf("concurrent metadata change was lost: %q", description)
 	}
-	if _, exists := metadata["comments"]; exists {
-		t.Fatalf("missing metadata field was synthesized: %#v", metadata)
+	metadata, ok := updatedPayload["metadata"].(map[string]any)
+	if !ok || len(metadata) != 1 || !reflect.DeepEqual(metadata["tags"], []any{"keep", "new"}) {
+		t.Fatalf("metadata tag patch = %#v", updatedPayload)
+	}
+	if _, exists := metadata["description"]; exists {
+		t.Fatalf("concurrent metadata was included in tag patch: %#v", metadata)
 	}
 	clearFlags, ok := updatedPayload["clearFlags"].(map[string]any)
 	if !ok || clearFlags["tags"] != false {
 		t.Fatalf("clear flags = %#v", updatedPayload["clearFlags"])
 	}
-	if len(updatedPayload) != 2 || len(clearFlags) != 1 || len(metadata) != 11 {
+	if len(updatedPayload) != 2 || len(clearFlags) != 1 {
 		t.Fatalf("wire body was not exact: %#v", updatedPayload)
 	}
 	if err := client.AddBookTagScoped(context.Background(), reference, "new"); err != nil {
@@ -357,6 +370,56 @@ func TestClientBookTagMutationPreservesMetadataAndIsIdempotent(t *testing.T) {
 	}
 	if err := client.AddBookTagScoped(context.Background(), reference, " "); !errors.Is(err, ErrEmptyTag) {
 		t.Fatalf("empty tag error = %v", err)
+	}
+}
+
+func TestClientBookTagMutationClearsFinalTag(t *testing.T) {
+	currentTags := []string{"only"}
+	var updatedPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/login":
+			writeJSON(w, map[string]string{"accessToken": "token"})
+		case "/api/v1/books/book-1":
+			writeJSON(w, map[string]any{
+				"id": "book-1", "libraryId": "library-1",
+				"metadata": map[string]any{"title": "Book", "tags": currentTags},
+				"files":    []any{},
+			})
+		case "/api/v1/libraries/library-1/book/book-1":
+			writeJSON(w, map[string]any{"id": "book-1", "libraryId": "library-1", "metadata": map[string]any{"title": "Book"}, "files": []any{}})
+		case "/api/v1/books/book-1/metadata":
+			if r.Method != http.MethodPut || r.URL.Query().Get("replaceMode") != "REPLACE_WHEN_PROVIDED" || len(r.URL.Query()) != 1 {
+				t.Errorf("metadata update request = %s %q", r.Method, r.URL.RawQuery)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&updatedPayload); err != nil {
+				t.Errorf("metadata body: %v", err)
+				return
+			}
+			metadata, metadataOK := updatedPayload["metadata"].(map[string]any)
+			clearFlags, clearFlagsOK := updatedPayload["clearFlags"].(map[string]any)
+			if len(updatedPayload) != 2 || !metadataOK || len(metadata) != 1 || !reflect.DeepEqual(metadata["tags"], []any{}) {
+				t.Errorf("final tag metadata patch = %#v", updatedPayload)
+			}
+			if !clearFlagsOK || len(clearFlags) != 1 || clearFlags["tags"] != true {
+				t.Errorf("final tag clear flags = %#v", updatedPayload["clearFlags"])
+			}
+			currentTags = []string{}
+			writeJSON(w, map[string]any{"ok": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "user", "password", server.Client(), 1<<20, 1<<20, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.RemoveBookTagScoped(context.Background(), BookReference{LibraryID: "library-1", BookID: "book-1"}, "only"); err != nil {
+		t.Fatal(err)
+	}
+	if len(currentTags) != 0 {
+		t.Fatalf("final tag was not cleared: %v", currentTags)
 	}
 }
 

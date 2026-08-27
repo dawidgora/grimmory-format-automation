@@ -44,6 +44,55 @@ func TestStorePersistsBookAndDerivedState(t *testing.T) {
 	}
 }
 
+func TestStorePersistsAndClearsDerivedUploadIntentWithDerivedState(t *testing.T) {
+	store, err := Open(t.TempDir(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	if err := store.SetBook(ctx, BookState{LibraryID: "library", BookID: "book", MainFormat: "epub", CanonicalFormat: "epub", CanonicalSHA256: "source-sha", UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	intent := DerivedUploadIntent{LibraryID: "library", BookID: "book", Format: "mobi", OutputName: "book.mobi", OutputSHA256: "output-sha", SourceSHA256: "source-sha", GenerationFingerprint: "generation-sha", UpdatedAt: now}
+	if err := store.SetDerivedUploadIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	intents, err := store.GetDerivedUploadIntents(ctx, "library", "book")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := intents["mobi"]; got.OutputName != intent.OutputName || got.OutputSHA256 != intent.OutputSHA256 || got.SourceSHA256 != intent.SourceSHA256 || got.GenerationFingerprint != intent.GenerationFingerprint || !got.UpdatedAt.Equal(now) {
+		t.Fatalf("upload intent = %+v", got)
+	}
+	if err := store.SetDerived(ctx, DerivedState{LibraryID: "library", BookID: "book", Format: "mobi", GrimmoryFileID: "file", SourceSHA256: "source-sha", OutputSHA256: "output-sha", GeneratedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	intents, err = store.GetDerivedUploadIntents(ctx, "library", "book")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(intents) != 0 {
+		t.Fatalf("derived upload intent was not cleared: %+v", intents)
+	}
+}
+
+func TestStoreRejectsIncompleteDerivedUploadIntent(t *testing.T) {
+	store, err := Open(t.TempDir(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.SetDerivedUploadIntent(context.Background(), DerivedUploadIntent{
+		LibraryID: "library", BookID: "book", Format: "mobi",
+		OutputName: "book.mobi", OutputSHA256: "output-sha", SourceSHA256: "source-sha",
+	}); err == nil {
+		t.Fatal("accepted upload intent without generation fingerprint")
+	}
+}
+
 func TestStoreLeavesExistingDerivedStateOnBookUpdate(t *testing.T) {
 	store, err := Open(t.TempDir(), time.Second)
 	if err != nil {

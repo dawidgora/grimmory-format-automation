@@ -12,7 +12,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -25,17 +24,18 @@ import (
 )
 
 var (
-	ErrInvalidBookID      = errors.New("invalid book ID")
-	ErrInvalidLibraryID   = errors.New("invalid library ID")
-	ErrNoSource           = errors.New("no configured source format is available")
-	ErrVerification       = errors.New("Grimmory upload verification failed")
-	ErrPartial            = errors.New("reconciliation completed with failures")
-	ErrState              = errors.New("reconciliation state operation failed")
-	ErrLibraryNotAllowed  = errors.New("library is not allowed")
-	ErrFailureTagMutation = errors.New("failure tag mutation failed")
-	ErrAmbiguousFile      = errors.New("Grimmory file inventory is ambiguous")
-	ErrPrimaryFile        = errors.New("primary Grimmory file cannot be deleted")
+	ErrInvalidBookID              = errors.New("invalid book ID")
+	ErrInvalidLibraryID           = errors.New("invalid library ID")
+	ErrNoSource                   = errors.New("no configured source format is available")
+	ErrVerification               = errors.New("Grimmory upload verification failed")
+	ErrPartial                    = errors.New("reconciliation completed with failures")
+	ErrState                      = errors.New("reconciliation state operation failed")
+	ErrLibraryNotAllowed          = errors.New("library is not allowed")
+	ErrFailureTagMutation         = errors.New("failure tag mutation failed")
+	ErrSafeReplacementUnavailable = errors.New("safe replacement unavailable")
 )
+
+const SafeReplacementUnavailableCode = "safe_replacement_unavailable"
 
 // ClassifyError returns a bounded, secret-safe category for operational logs.
 // It intentionally does not include the underlying error text.
@@ -69,6 +69,8 @@ func ClassifyError(err error) string {
 		return "validation"
 	case errors.Is(err, ErrNoSource):
 		return "no_source"
+	case errors.Is(err, ErrSafeReplacementUnavailable):
+		return SafeReplacementUnavailableCode
 	case errors.Is(err, ErrPartial):
 		return "reconciliation"
 	default:
@@ -81,6 +83,10 @@ type partialError struct{ cause error }
 func (e *partialError) Error() string { return ErrPartial.Error() }
 
 func (e *partialError) Unwrap() error { return ErrPartial }
+
+func (e *partialError) Is(target error) bool {
+	return target == ErrPartial || errors.Is(e.cause, target)
+}
 
 func (e *partialError) Cause() error { return e.cause }
 
@@ -123,7 +129,9 @@ type FailureTagSetter interface {
 
 type Store interface {
 	Get(context.Context, string, string) (state.BookState, map[string]state.DerivedState, error)
+	GetDerivedUploadIntents(context.Context, string, string) (map[string]state.DerivedUploadIntent, error)
 	SetBook(context.Context, state.BookState) error
+	SetDerivedUploadIntent(context.Context, state.DerivedUploadIntent) error
 	SetDerived(context.Context, state.DerivedState) error
 }
 
@@ -386,6 +394,11 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 		result.Error = "state_read_failed"
 		return result, fmt.Errorf("%w: %v", ErrState, err)
 	}
+	uploadIntents, err := s.store.GetDerivedUploadIntents(ctx, libraryID, bookID)
+	if err != nil {
+		result.Error = "state_read_failed"
+		return result, fmt.Errorf("%w: %v", ErrState, err)
+	}
 	mainFile, hasMain := FindFile(book.Files, policy.MainFormat)
 	if !hasMain {
 		source, ok := SelectSource(book.Files, policy.MainFormat, policy.FallbackFormats)
@@ -404,7 +417,13 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 				if _, exists := FindFile(book.Files, format); exists {
 					action = "rebuild"
 				}
-				result.Derivatives = append(result.Derivatives, ItemResult{Format: format, SourceFormat: policy.MainFormat, Action: action, Status: "planned", Reason: "main_would_be_created"})
+				item := ItemResult{Format: format, SourceFormat: policy.MainFormat, Action: action, Status: "planned", Reason: "main_would_be_created"}
+				if action == "rebuild" {
+					item.Status = "blocked"
+					item.Error = SafeReplacementUnavailableCode
+					result.Error = SafeReplacementUnavailableCode
+				}
+				result.Derivatives = append(result.Derivatives, item)
 			}
 			result.Status = "dry_run"
 			return result, nil
@@ -455,20 +474,78 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 		}
 	}
 	generationFingerprints := DesiredGenerationFingerprints(book, canonicalSHA, canonicalName, policy.OutputFormats)
-	plans := PlanDerivatives(book.Files, policy.OutputFormats, policy.MainFormat, canonicalSHA, savedDerived, canonicalMTime, canonicalTrustedMTime, false, options.Force, completeBookState(savedBook), generationFingerprints)
+	plans := PlanDerivatives(book.Files, policy.OutputFormats, policy.MainFormat, canonicalSHA, savedDerived, canonicalMTime, canonicalTrustedMTime, false, options.Force, false, generationFingerprints, canonicalName)
 	if options.DryRun {
 		for _, plan := range plans {
-			result.Derivatives = append(result.Derivatives, ItemResult{Format: plan.Format, SourceFormat: policy.MainFormat, Action: plan.Action, Status: "planned", Reason: plan.Reason})
+			item := ItemResult{Format: plan.Format, SourceFormat: policy.MainFormat, Action: plan.Action, Status: "planned", Reason: plan.Reason}
+			if plan.Blocked {
+				item.Status = "blocked"
+				item.Error = SafeReplacementUnavailableCode
+				result.Error = SafeReplacementUnavailableCode
+			}
+			result.Derivatives = append(result.Derivatives, item)
 		}
 		result.Status = "dry_run"
 		return result, nil
 	}
 	failed := false
+	blocked := false
 	var firstFailure error
 	for _, plan := range plans {
 		item := ItemResult{Format: plan.Format, SourceFormat: policy.MainFormat, Action: plan.Action, Reason: plan.Reason}
 		if plan.Action == "unchanged" {
 			item.Status = "unchanged"
+			result.Derivatives = append(result.Derivatives, item)
+			continue
+		}
+		if plan.Blocked {
+			if options.Force {
+				item.Status = "blocked"
+				item.Error = SafeReplacementUnavailableCode
+				failed = true
+				blocked = true
+				if firstFailure == nil {
+					firstFailure = ErrSafeReplacementUnavailable
+				}
+				result.Derivatives = append(result.Derivatives, item)
+				continue
+			}
+			intent := uploadIntents[plan.Format]
+			candidate, recoverable, recoveryErr := s.recoverableIntentCandidate(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, workspace, book.Files, plan, intent, canonicalSHA, canonicalName, mainFile.ID, policy.MainFormat)
+			if recoveryErr != nil {
+				failed = true
+				if firstFailure == nil {
+					firstFailure = recoveryErr
+				}
+				item.Status = "failed"
+				item.Error = codeForError(recoveryErr, "derivative_failed")
+				result.Derivatives = append(result.Derivatives, item)
+				continue
+			}
+			if recoverable {
+				if err := s.store.SetDerived(ctx, adoptedDerivedState(libraryID, bookID, plan, candidate, intent)); err != nil {
+					stateErr := fmt.Errorf("%w: %v", ErrState, err)
+					failed = true
+					if firstFailure == nil {
+						firstFailure = stateErr
+					}
+					item.Status = "failed"
+					item.Error = codeForError(stateErr, "state_write_failed")
+					result.Derivatives = append(result.Derivatives, item)
+					continue
+				}
+				item.Status = "adopted"
+				item.Reason = "upload_intent_recovered"
+				result.Derivatives = append(result.Derivatives, item)
+				continue
+			}
+			item.Status = "blocked"
+			item.Error = SafeReplacementUnavailableCode
+			failed = true
+			blocked = true
+			if firstFailure == nil {
+				firstFailure = ErrSafeReplacementUnavailable
+			}
 			result.Derivatives = append(result.Derivatives, item)
 			continue
 		}
@@ -483,11 +560,13 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 			}
 		}
 		before, hadBefore := FindFile(book.Files, plan.Format)
-		if conversionErr == nil && plan.Action == "rebuild" {
-			before, hadBefore, conversionErr = s.prepareDerivativeReplacement(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, plan.Format, policy.MainFormat, mainFile.ID)
-		}
 		if conversionErr == nil {
-			conversionErr = s.upload(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, plan.Format, outputPath, canonicalName)
+			intent := state.DerivedUploadIntent{LibraryID: libraryID, BookID: bookID, Format: plan.Format, OutputName: desiredOutputName(canonicalName, plan.Format), OutputSHA256: outputSHA, SourceSHA256: canonicalSHA, GenerationFingerprint: plan.GenerationFingerprint, UpdatedAt: time.Now().UTC()}
+			if intentErr := s.store.SetDerivedUploadIntent(ctx, intent); intentErr != nil {
+				conversionErr = fmt.Errorf("%w: %v", ErrState, intentErr)
+			} else {
+				conversionErr = s.upload(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, plan.Format, outputPath, canonicalName)
+			}
 		}
 		if conversionErr == nil {
 			verifiedBook, verifyErr := s.client.GetLibraryBook(ctx, libraryID, bookID)
@@ -518,7 +597,14 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 	}
 	if failed {
 		result.Status = "partial"
-		result.Error = "derivative_failed"
+		if blocked {
+			result.Error = SafeReplacementUnavailableCode
+		} else {
+			result.Error = "derivative_failed"
+		}
+		if blocked {
+			firstFailure = ErrSafeReplacementUnavailable
+		}
 		return result, newPartialError(firstFailure)
 	}
 	canonicalState.LastSuccessfulSync = time.Now().UTC()
@@ -591,11 +677,68 @@ func (s *Service) createMissingMain(ctx context.Context, libraryID, bookID strin
 	}
 	result.Main.Status, result.Main.Action, result.Main.Reason = "created", "created", "main_missing"
 	generationFingerprints := DesiredGenerationFingerprints(verifiedBook, verifiedMainSHA, canonicalName, policy.OutputFormats)
-	plans := PlanDerivatives(verifiedBook.Files, policy.OutputFormats, policy.MainFormat, verifiedMainSHA, nil, verifiedMain.MTime, verifiedMain.TrustedMTime, true, options.Force, completeBookState(savedBook), generationFingerprints)
+	plans := PlanDerivatives(verifiedBook.Files, policy.OutputFormats, policy.MainFormat, verifiedMainSHA, nil, verifiedMain.MTime, verifiedMain.TrustedMTime, true, options.Force, false, generationFingerprints, canonicalName)
+	uploadIntents, err := s.store.GetDerivedUploadIntents(ctx, libraryID, bookID)
+	if err != nil {
+		result.Status, result.Error = "partial", "state_read_failed"
+		return result, fmt.Errorf("%w: %v", ErrState, err)
+	}
 	failed := false
+	blocked := false
 	var firstFailure error
 	for _, plan := range plans {
 		item := ItemResult{Format: plan.Format, SourceFormat: policy.MainFormat, Action: plan.Action, Reason: plan.Reason, Status: "failed"}
+		if plan.Blocked {
+			if options.Force {
+				item.Status = "blocked"
+				item.Error = SafeReplacementUnavailableCode
+				failed = true
+				blocked = true
+				if firstFailure == nil {
+					firstFailure = ErrSafeReplacementUnavailable
+				}
+				result.Derivatives = append(result.Derivatives, item)
+				continue
+			}
+			intent := uploadIntents[plan.Format]
+			candidate, recoverable, recoveryErr := s.recoverableIntentCandidate(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, workspace, verifiedBook.Files, plan, intent, verifiedMainSHA, canonicalName, verifiedMain.ID, policy.MainFormat)
+			if recoveryErr != nil {
+				failed = true
+				if firstFailure == nil {
+					firstFailure = recoveryErr
+				}
+				item.Status = "failed"
+				item.Error = codeForError(recoveryErr, "derivative_failed")
+				result.Derivatives = append(result.Derivatives, item)
+				continue
+			}
+			if recoverable {
+				if err := s.store.SetDerived(ctx, adoptedDerivedState(libraryID, bookID, plan, candidate, intent)); err != nil {
+					stateErr := fmt.Errorf("%w: %v", ErrState, err)
+					failed = true
+					if firstFailure == nil {
+						firstFailure = stateErr
+					}
+					item.Status = "failed"
+					item.Error = codeForError(stateErr, "state_write_failed")
+					result.Derivatives = append(result.Derivatives, item)
+					continue
+				}
+				item.Status = "adopted"
+				item.Reason = "upload_intent_recovered"
+				result.Derivatives = append(result.Derivatives, item)
+				continue
+			}
+			item.Status = "blocked"
+			item.Error = SafeReplacementUnavailableCode
+			failed = true
+			blocked = true
+			if firstFailure == nil {
+				firstFailure = ErrSafeReplacementUnavailable
+			}
+			result.Derivatives = append(result.Derivatives, item)
+			continue
+		}
 		outputPath, conversionErr := s.convert(ctx, mainPath, policy.MainFormat, plan.Format, workspace)
 		var outputSHA string
 		before, hadBefore := FindFile(verifiedBook.Files, plan.Format)
@@ -606,11 +749,13 @@ func (s *Service) createMissingMain(ctx context.Context, libraryID, bookID strin
 				outputSHA, _, conversionErr = convert.HashFile(outputPath, s.maxFileBytes)
 			}
 		}
-		if conversionErr == nil && plan.Action == "rebuild" {
-			before, hadBefore, conversionErr = s.prepareDerivativeReplacement(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, plan.Format, policy.MainFormat, verifiedMain.ID)
-		}
 		if conversionErr == nil {
-			conversionErr = s.upload(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, plan.Format, outputPath, canonicalName)
+			intent := state.DerivedUploadIntent{LibraryID: libraryID, BookID: bookID, Format: plan.Format, OutputName: desiredOutputName(canonicalName, plan.Format), OutputSHA256: outputSHA, SourceSHA256: verifiedMainSHA, GenerationFingerprint: plan.GenerationFingerprint, UpdatedAt: time.Now().UTC()}
+			if intentErr := s.store.SetDerivedUploadIntent(ctx, intent); intentErr != nil {
+				conversionErr = fmt.Errorf("%w: %v", ErrState, intentErr)
+			} else {
+				conversionErr = s.upload(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, plan.Format, outputPath, canonicalName)
+			}
 		}
 		if conversionErr == nil {
 			verified, verifyErr := s.client.GetLibraryBook(ctx, libraryID, bookID)
@@ -640,7 +785,13 @@ func (s *Service) createMissingMain(ctx context.Context, libraryID, bookID strin
 		result.Derivatives = append(result.Derivatives, item)
 	}
 	if failed {
-		result.Status, result.Error = "partial", "derivative_failed"
+		result.Status = "partial"
+		if blocked {
+			result.Error = SafeReplacementUnavailableCode
+			firstFailure = ErrSafeReplacementUnavailable
+		} else {
+			result.Error = "derivative_failed"
+		}
 		return result, newPartialError(firstFailure)
 	}
 	canonicalState.LastSuccessfulSync = time.Now().UTC()
@@ -705,11 +856,20 @@ type DerivativePlan struct {
 	Action                string
 	Reason                string
 	GenerationFingerprint string
+	Blocked               bool
 }
 
 // PlanDerivatives returns actions for configured outputs. Existing derivatives
-// are preserved only when their complete checkpoint establishes ownership.
-func PlanDerivatives(files []grimmory.File, outputs []string, mainFormat, canonicalSHA string, saved map[string]state.DerivedState, canonicalMTime time.Time, canonicalTrusted, canonicalRecreated, force, bookCheckpointComplete bool, desiredFingerprints map[string]string) []DerivativePlan {
+// are never replaced; rebuild actions for them are marked blocked because the
+// deployment has no atomic replacement operation. The book checkpoint argument
+// is retained for call-site compatibility, but derivative ownership is decided
+// from each derivative's own evidence. An optional canonical name enables the
+// independent output-name check needed for legacy v1 fingerprint compatibility.
+func PlanDerivatives(files []grimmory.File, outputs []string, mainFormat, canonicalSHA string, saved map[string]state.DerivedState, canonicalMTime time.Time, canonicalTrusted, canonicalRecreated, force, _ bool, desiredFingerprints map[string]string, canonicalNames ...string) []DerivativePlan {
+	canonicalName := ""
+	if len(canonicalNames) > 0 {
+		canonicalName = canonicalNames[0]
+	}
 	result := make([]DerivativePlan, 0, len(outputs))
 	for _, format := range outputs {
 		format = normalizeFormat(format)
@@ -730,10 +890,6 @@ func PlanDerivatives(files []grimmory.File, outputs []string, mainFormat, canoni
 			continue
 		}
 		previous, tracked := saved[format]
-		if !bookCheckpointComplete {
-			result = append(result, derivativePlan(format, "rebuild", "state_incomplete", desiredFingerprints))
-			continue
-		}
 		if !tracked {
 			result = append(result, derivativePlan(format, "rebuild", "state_missing", desiredFingerprints))
 			continue
@@ -742,8 +898,16 @@ func PlanDerivatives(files []grimmory.File, outputs []string, mainFormat, canoni
 			result = append(result, derivativePlan(format, "rebuild", "state_incomplete", desiredFingerprints))
 			continue
 		}
+		if previous.Format != format {
+			result = append(result, derivativePlan(format, "rebuild", "output_format_changed", desiredFingerprints))
+			continue
+		}
 		if existing.ID != "" && previous.GrimmoryFileID != existing.ID {
 			result = append(result, derivativePlan(format, "rebuild", "output_identity_changed", desiredFingerprints))
+			continue
+		}
+		if canonicalName != "" && existing.Name != desiredOutputName(canonicalName, format) {
+			result = append(result, derivativePlan(format, "rebuild", "output_name_changed", desiredFingerprints))
 			continue
 		}
 		if canonicalSHA != "" && tracked && previous.SourceSHA256 != "" && previous.SourceSHA256 != canonicalSHA {
@@ -759,7 +923,8 @@ func PlanDerivatives(files []grimmory.File, outputs []string, mainFormat, canoni
 				result = append(result, derivativePlan(format, "rebuild", "generation_fingerprint_missing", desiredFingerprints))
 				continue
 			}
-			if previous.GenerationFingerprint != desired {
+			legacyNameMatches := canonicalName != "" && existing.Name == desiredOutputName(canonicalName, format)
+			if previous.GenerationFingerprint != desired && !legacyV1FingerprintCompatible(previous.GenerationFingerprint, legacyNameMatches) {
 				result = append(result, derivativePlan(format, "rebuild", "generation_fingerprint_changed", desiredFingerprints))
 				continue
 			}
@@ -782,159 +947,56 @@ func PlanDerivatives(files []grimmory.File, outputs []string, mainFormat, canoni
 }
 
 func derivativePlan(format, action, reason string, desiredFingerprints map[string]string) DerivativePlan {
-	return DerivativePlan{Format: format, Action: action, Reason: reason, GenerationFingerprint: desiredFingerprints[format]}
+	return DerivativePlan{
+		Format: format, Action: action, Reason: reason,
+		GenerationFingerprint: desiredFingerprints[format],
+		Blocked:               action == "rebuild",
+	}
 }
 
 const generationFingerprintVersion = "v1"
 
 // DesiredGenerationFingerprints returns a deterministic checkpoint for each
-// configured output, including target-specific material metadata.
-func DesiredGenerationFingerprints(book grimmory.Book, canonicalSHA, sourceName string, outputs []string) map[string]string {
+// configured output. The book argument is retained for call-site compatibility;
+// only values passed to conversion/upload participate in the checkpoint.
+func DesiredGenerationFingerprints(_ grimmory.Book, canonicalSHA, sourceName string, outputs []string) map[string]string {
 	result := make(map[string]string, len(outputs))
 	for _, format := range outputs {
 		format = normalizeFormat(format)
 		if format == "" {
 			continue
 		}
-		result[format] = GenerationFingerprint(book, canonicalSHA, sourceName, format)
+		result[format] = GenerationFingerprint(grimmory.Book{}, canonicalSHA, sourceName, format)
 	}
 	return result
 }
 
 // GenerationFingerprint returns the versioned identity of a desired output
-// from its content, filename, target format, and material target metadata.
-func GenerationFingerprint(book grimmory.Book, canonicalSHA, sourceName, targetFormat string) string {
+// from the canonical content hash, desired output name, and target format.
+func GenerationFingerprint(_ grimmory.Book, canonicalSHA, sourceName, targetFormat string) string {
 	targetFormat = normalizeFormat(targetFormat)
 	projection := generationFingerprintProjection{
 		CanonicalContentIdentity: strings.ToLower(strings.TrimSpace(canonicalSHA)),
 		DesiredOutputName:        desiredOutputName(sourceName, targetFormat),
 		TargetFormat:             targetFormat,
-		MaterialMetadata:         generationMetadataProjection(book.Metadata, targetFormat),
 	}
 	encoded, _ := json.Marshal(projection)
 	digest := sha256.Sum256(encoded)
 	return generationFingerprintVersion + ":" + hex.EncodeToString(digest[:])
 }
 
+func legacyV1FingerprintCompatible(value string, coreIdentityMatches bool) bool {
+	if !coreIdentityMatches || !strings.HasPrefix(value, "v1:") {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(value, "v1:"))
+	return err == nil && len(strings.TrimPrefix(value, "v1:")) == sha256.Size*2
+}
+
 type generationFingerprintProjection struct {
 	CanonicalContentIdentity string `json:"canonicalContentIdentity"`
 	DesiredOutputName        string `json:"desiredOutputName"`
 	TargetFormat             string `json:"targetFormat"`
-	MaterialMetadata         any    `json:"materialMetadata"`
-}
-
-type fullGenerationMetadata struct {
-	Title           string                 `json:"title"`
-	Authors         []string               `json:"authors"`
-	Language        string                 `json:"language"`
-	Publisher       string                 `json:"publisher"`
-	PublicationDate string                 `json:"publicationDate"`
-	Identifiers     []generationIdentifier `json:"identifiers"`
-	Series          string                 `json:"series"`
-	SeriesIndex     string                 `json:"seriesIndex"`
-	Tags            []string               `json:"tags"`
-	Description     string                 `json:"description"`
-	Comments        string                 `json:"comments"`
-}
-
-type mobiGenerationMetadata struct {
-	Title           string                 `json:"title"`
-	Authors         []string               `json:"authors"`
-	Language        string                 `json:"language"`
-	Publisher       string                 `json:"publisher"`
-	PublicationDate string                 `json:"publicationDate"`
-	Identifiers     []generationIdentifier `json:"identifiers"`
-	Description     string                 `json:"description"`
-}
-
-type generationIdentifier struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
-}
-
-func generationMetadataProjection(metadata grimmory.BookMetadata, targetFormat string) any {
-	authors := normalizedGenerationAuthors(metadata.Authors)
-	identifiers := normalizedGenerationIdentifiers(metadata.Identifiers)
-	switch targetFormat {
-	case "epub", "azw3":
-		return fullGenerationMetadata{
-			Title:           strings.TrimSpace(metadata.Title),
-			Authors:         authors,
-			Language:        strings.TrimSpace(metadata.Language),
-			Publisher:       strings.TrimSpace(metadata.Publisher),
-			PublicationDate: strings.TrimSpace(metadata.PublicationDate),
-			Identifiers:     identifiers,
-			Series:          strings.TrimSpace(metadata.Series),
-			SeriesIndex:     strings.TrimSpace(metadata.SeriesIndex),
-			Tags:            normalizedGenerationTags(metadata.Tags),
-			Description:     strings.TrimSpace(metadata.Description),
-			Comments:        strings.TrimSpace(metadata.Comments),
-		}
-	case "mobi":
-		return mobiGenerationMetadata{
-			Title:           strings.TrimSpace(metadata.Title),
-			Authors:         authors,
-			Language:        strings.TrimSpace(metadata.Language),
-			Publisher:       strings.TrimSpace(metadata.Publisher),
-			PublicationDate: strings.TrimSpace(metadata.PublicationDate),
-			Identifiers:     identifiers,
-			Description:     strings.TrimSpace(metadata.Description),
-		}
-	default:
-		return nil
-	}
-}
-
-func normalizedGenerationAuthors(values []string) []string {
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		if value = strings.TrimSpace(value); value != "" {
-			result = append(result, value)
-		}
-	}
-	return result
-}
-
-func normalizedGenerationIdentifiers(values map[string]string) []generationIdentifier {
-	byKey := make(map[string]string, len(values))
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		normalizedKey, normalizedValue := strings.ToLower(strings.TrimSpace(key)), strings.TrimSpace(values[key])
-		if normalizedKey != "" && normalizedValue != "" {
-			byKey[normalizedKey] = normalizedValue
-		}
-	}
-	normalizedKeys := make([]string, 0, len(byKey))
-	for key := range byKey {
-		normalizedKeys = append(normalizedKeys, key)
-	}
-	sort.Strings(normalizedKeys)
-	result := make([]generationIdentifier, 0, len(normalizedKeys))
-	for _, key := range normalizedKeys {
-		result = append(result, generationIdentifier{Key: key, Value: byKey[key]})
-	}
-	return result
-}
-
-func normalizedGenerationTags(values []string) []string {
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		if value = strings.TrimSpace(value); value != "" {
-			result = append(result, value)
-		}
-	}
-	sort.Strings(result)
-	unique := result[:0]
-	for _, value := range result {
-		if len(unique) == 0 || unique[len(unique)-1] != value {
-			unique = append(unique, value)
-		}
-	}
-	return unique
 }
 
 func desiredOutputName(sourceName, targetFormat string) string {
@@ -982,85 +1044,109 @@ func (s *Service) upload(ctx context.Context, reference grimmory.BookReference, 
 	return s.client.UploadFileNamedScoped(ctx, reference, format, filePath, desiredOutputName(sourceName, format))
 }
 
-// prepareDerivativeReplacement refreshes inventory before deleting a rebuild
-// target. A target missing at delete time is safe to replace; creates never
-// delete.
-func (s *Service) prepareDerivativeReplacement(ctx context.Context, reference grimmory.BookReference, format, mainFormat, canonicalFileID string) (grimmory.File, bool, error) {
+func completeDerivedState(value state.DerivedState) bool {
+	return value.BookID != "" && value.Format != "" && value.GrimmoryFileID != "" && value.SourceSHA256 != "" && value.OutputSHA256 != "" && !value.GeneratedAt.IsZero()
+}
+
+func (s *Service) recoverableIntentCandidate(ctx context.Context, reference grimmory.BookReference, workspace string, files []grimmory.File, plan DerivativePlan, intent state.DerivedUploadIntent, canonicalSHA, canonicalName, canonicalFileID, canonicalFormat string) (grimmory.File, bool, error) {
+	if intent.Format != plan.Format || intent.OutputName != desiredOutputName(canonicalName, plan.Format) || intent.OutputSHA256 == "" {
+		return grimmory.File{}, false, nil
+	}
+	if intent.SourceSHA256 == "" || canonicalSHA == "" || !strings.EqualFold(intent.SourceSHA256, canonicalSHA) {
+		return grimmory.File{}, false, nil
+	}
+	if intent.GenerationFingerprint == "" || intent.GenerationFingerprint != plan.GenerationFingerprint {
+		return grimmory.File{}, false, nil
+	}
+	candidate, ok := uniqueIntentCandidate(files, plan, intent.OutputName, canonicalFileID)
+	if !ok {
+		return grimmory.File{}, false, nil
+	}
+	// Inventory hashes are advisory. Download through the bounded scoped path
+	// and use the locally calculated hash as the artifact identity.
+	adoptionPath, outputSHA, err := s.download(ctx, reference, plan.Format, workspace, "adoption-"+plan.Format)
+	if adoptionPath != "" {
+		defer os.Remove(adoptionPath)
+	}
+	if err != nil {
+		return grimmory.File{}, false, err
+	}
+	if !strings.EqualFold(outputSHA, intent.OutputSHA256) {
+		return grimmory.File{}, false, nil
+	}
+	// Revalidate the scoped inventory immediately before the caller commits
+	// ownership so a changed or ambiguous candidate is never adopted.
 	current, err := s.client.GetLibraryBook(ctx, reference.LibraryID, reference.BookID)
 	if err != nil {
 		return grimmory.File{}, false, err
 	}
 	if current.ID != reference.BookID {
-		return grimmory.File{}, false, grimmory.ErrInvalidResponse
+		return grimmory.File{}, false, fmt.Errorf("%w: book identity mismatch", grimmory.ErrInvalidResponse)
 	}
 	if current.LibraryID != reference.LibraryID {
 		return grimmory.File{}, false, grimmory.ErrBookNotInLibrary
 	}
-	format = normalizeFormat(format)
-	if format == "" {
-		return grimmory.File{}, false, ErrAmbiguousFile
-	}
-	existingFiles := filesForFormat(current.Files, format)
-	switch len(existingFiles) {
-	case 0:
+	if !sameCanonicalSource(current.Files, canonicalFormat, canonicalFileID, canonicalName) {
 		return grimmory.File{}, false, nil
-	case 1:
-		if existingFiles[0].ID == "" {
-			return grimmory.File{}, false, ErrAmbiguousFile
-		}
-	default:
-		return grimmory.File{}, false, ErrAmbiguousFile
 	}
-	existing := existingFiles[0]
-	if format == normalizeFormat(mainFormat) {
-		return grimmory.File{}, false, ErrPrimaryFile
+	currentCandidate, ok := uniqueIntentCandidate(current.Files, plan, intent.OutputName, canonicalFileID)
+	if !ok || currentCandidate.ID != candidate.ID || currentCandidate.Name != intent.OutputName {
+		return grimmory.File{}, false, nil
 	}
-	primaryFiles := filesForFormat(current.Files, mainFormat)
-	switch len(primaryFiles) {
-	case 0:
-		return grimmory.File{}, false, ErrPrimaryFile
-	case 1:
-	default:
-		return grimmory.File{}, false, ErrAmbiguousFile
+	return currentCandidate, true, nil
+}
+
+func sameCanonicalSource(files []grimmory.File, format, fileID, fileName string) bool {
+	if fileID == "" {
+		return false
 	}
-	if primaryFiles[0].ID != "" && primaryFiles[0].ID == existing.ID {
-		return grimmory.File{}, false, ErrPrimaryFile
+	canonicalFiles := filesForFormat(files, format)
+	if len(canonicalFiles) != 1 {
+		return false
 	}
-	if canonicalFileID != "" && canonicalFileID == existing.ID {
-		return grimmory.File{}, false, ErrPrimaryFile
+	canonical := canonicalFiles[0]
+	return canonical.ID == fileID && effectiveFileName(canonical.Name, format) == effectiveFileName(fileName, format)
+}
+
+func effectiveFileName(name, format string) string {
+	if name == "" {
+		return desiredOutputName("", format)
+	}
+	return name
+}
+
+func uniqueIntentCandidate(files []grimmory.File, plan DerivativePlan, expectedName, canonicalFileID string) (grimmory.File, bool) {
+	candidates := filesForFormat(files, plan.Format)
+	if len(candidates) != 1 {
+		return grimmory.File{}, false
+	}
+	candidate := candidates[0]
+	if candidate.ID == "" || candidate.Name != expectedName {
+		return grimmory.File{}, false
+	}
+	if canonicalFileID != "" && candidate.ID == canonicalFileID {
+		return grimmory.File{}, false
 	}
 	identityMatches := 0
-	for _, file := range current.Files {
-		if file.ID == existing.ID {
+	for _, file := range files {
+		if file.ID == candidate.ID {
 			identityMatches++
 		}
 	}
 	if identityMatches != 1 {
-		return grimmory.File{}, false, ErrAmbiguousFile
+		return grimmory.File{}, false
 	}
-	if err := s.client.DeleteFileScoped(ctx, reference, existing.ID); err != nil {
-		// Another writer can remove the planned target after this inventory read
-		// but before DELETE. In that case the replacement upload is still safe.
-		if missingDerivativeFile(err) {
-			return existing, true, nil
-		}
-		return grimmory.File{}, false, err
-	}
-	return existing, true, nil
+	return candidate, true
 }
 
-func missingDerivativeFile(err error) bool {
-	if errors.Is(err, grimmory.ErrFileNotFound) {
-		return true
+func adoptedDerivedState(libraryID, bookID string, plan DerivativePlan, candidate grimmory.File, intent state.DerivedUploadIntent) state.DerivedState {
+	return state.DerivedState{
+		LibraryID: libraryID, BookID: bookID, Format: plan.Format,
+		GrimmoryFileID: candidate.ID, SourceSHA256: intent.SourceSHA256,
+		OutputSHA256: intent.OutputSHA256, GenerationFingerprint: intent.GenerationFingerprint,
+		TrustedMTime: candidate.MTime, HasMTime: candidate.TrustedMTime,
+		GeneratedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
-	if !errors.Is(err, grimmory.ErrNotFound) {
-		return false
-	}
-	var httpErr *grimmory.HTTPError
-	if !errors.As(err, &httpErr) {
-		return true
-	}
-	return httpErr.Operation == "delete" || httpErr.Operation == "file delete"
 }
 
 func filesForFormat(files []grimmory.File, format string) []grimmory.File {
@@ -1072,14 +1158,6 @@ func filesForFormat(files []grimmory.File, format string) []grimmory.File {
 		}
 	}
 	return result
-}
-
-func completeBookState(value state.BookState) bool {
-	return value.BookID != "" && value.MainFormat != "" && value.CanonicalFormat != "" && value.CanonicalFileID != "" && value.CanonicalFileName != "" && value.CanonicalSHA256 != "" && !value.LastSuccessfulSync.IsZero()
-}
-
-func completeDerivedState(value state.DerivedState) bool {
-	return value.BookID != "" && value.Format != "" && value.GrimmoryFileID != "" && value.SourceSHA256 != "" && value.OutputSHA256 != "" && !value.GeneratedAt.IsZero()
 }
 
 // verifyUploadedFile requires evidence that the post-upload inventory is the
@@ -1127,20 +1205,18 @@ func FindFile(files []grimmory.File, format string) (grimmory.File, bool) {
 }
 
 func findUploadedFile(files []grimmory.File, format, desiredName, outputSHA string) (grimmory.File, bool) {
-	format = normalizeFormat(format)
-	for _, file := range files {
-		if normalizeFormat(file.Format) == format && file.Name == desiredName && (file.SHA256 == "" || strings.EqualFold(file.SHA256, outputSHA)) {
-			return file, true
-		}
+	candidates := filesForFormat(files, format)
+	if len(candidates) != 1 {
+		return grimmory.File{}, false
 	}
-	if outputSHA != "" {
-		for _, file := range files {
-			if normalizeFormat(file.Format) == format && file.SHA256 != "" && strings.EqualFold(file.SHA256, outputSHA) {
-				return file, true
-			}
-		}
+	candidate := candidates[0]
+	if candidate.Name != desiredName {
+		return grimmory.File{}, false
 	}
-	return FindFile(files, format)
+	if candidate.SHA256 != "" && !strings.EqualFold(candidate.SHA256, outputSHA) {
+		return grimmory.File{}, false
+	}
+	return candidate, true
 }
 
 func verifiedHash(file grimmory.File, fallback string) (string, error) {

@@ -297,7 +297,8 @@ func (c *Client) GetLibraryBook(ctx context.Context, libraryID, bookID string) (
 // SetBookTagScoped safely adds or removes one exact tag. It first reads the
 // complete metadata snapshot, avoids a PUT when the requested state already
 // holds, proves library membership immediately before the metadata PUT, and
-// verifies the resulting tag set with a fresh full-book read.
+// verifies the resulting tag set with a fresh full-book read. The update only
+// provides tags so concurrent changes to other metadata fields are preserved.
 func (c *Client) SetBookTagScoped(ctx context.Context, reference BookReference, tag string, present bool) error {
 	if err := reference.validate(); err != nil {
 		return err
@@ -327,19 +328,15 @@ func (c *Client) SetBookTagScoped(ctx context.Context, reference BookReference, 
 		tags = append(tags, value)
 	}
 	sort.Strings(tags)
-	metadata, ok := metadataPayload(book)
-	if !ok {
-		return fmt.Errorf("%w: full nested metadata is missing", ErrInvalidResponse)
-	}
-	metadata["tags"] = tags
+	clearTags := !present && len(tags) == 0
 	encoded, err := json.Marshal(map[string]any{
-		"metadata":   metadata,
-		"clearFlags": map[string]any{"tags": false},
+		"metadata":   map[string]any{"tags": tags},
+		"clearFlags": map[string]any{"tags": clearTags},
 	})
 	if err != nil {
 		return fmt.Errorf("encode Grimmory metadata update: %w", err)
 	}
-	response, err := c.doWithPreflight(ctx, http.MethodPut, c.bookPath(reference.BookID)+"/metadata", func() (io.ReadCloser, string, error) {
+	response, err := c.doWithPreflight(ctx, http.MethodPut, c.bookPath(reference.BookID)+"/metadata?replaceMode=REPLACE_WHEN_PROVIDED", func() (io.ReadCloser, string, error) {
 		return io.NopCloser(bytes.NewReader(encoded)), "application/json", nil
 	}, func(ctx context.Context) error {
 		return c.verifyBookMembership(ctx, reference)
