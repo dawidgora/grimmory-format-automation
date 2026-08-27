@@ -43,7 +43,7 @@ func main() {
 		log.Fatal(err)
 	}
 	if generated {
-		// Deliberately log only the storage path, never the credential.
+		// Never log the credential.
 		logger.Log(logging.Info, logging.Field{Key: "message", Value: "generated API key"}, logging.Field{Key: "path", Value: cfg.APIKeyPath})
 	}
 
@@ -98,8 +98,7 @@ func main() {
 		Handler:           api.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       cfg.HTTPTimeout,
-		// A reconciliation can run several conversions sequentially. Do not impose
-		// a server-wide write deadline shorter than a valid one-book sync.
+		// Allow all sequential conversions in a valid one-book sync to complete.
 		WriteTimeout: 0,
 		IdleTimeout:  60 * time.Second,
 		BaseContext:  func(net.Listener) context.Context { return ctx },
@@ -119,7 +118,7 @@ func main() {
 	go func() {
 		defer close(shutdownDone)
 		<-ctx.Done()
-		// One request may create the main plus every configured derivative.
+		// Allow time for the main and configured derivative conversions.
 		shutdownWindow := cfg.ConversionTimeout*time.Duration(len(cfg.OutputFormats)+1) + cfg.HTTPTimeout
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownWindow)
 		defer cancel()
@@ -133,7 +132,7 @@ func main() {
 		log.Fatal(err)
 	}
 	if ctx.Err() != nil {
-		// Shutdown waits for active handlers; do not close state while a sync runs.
+		// Wait for active handlers before closing state.
 		<-shutdownDone
 		pollWG.Wait()
 	}

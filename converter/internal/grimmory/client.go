@@ -267,8 +267,8 @@ func (c *Client) GetLibraryBooks(ctx context.Context, libraryID string) ([]Book,
 	return c.ListLibraryBooks(ctx, libraryID)
 }
 
-// GetLibraryBook retrieves a globally identified book through a library
-// endpoint and requires the response to prove both requested identities.
+// GetLibraryBook retrieves a book through a library endpoint and verifies both
+// requested identities.
 func (c *Client) GetLibraryBook(ctx context.Context, libraryID, bookID string) (Book, error) {
 	if err := validateID(libraryID); err != nil {
 		return Book{}, err
@@ -797,8 +797,7 @@ func (c *Client) UploadFileScoped(ctx context.Context, reference BookReference, 
 	return c.uploadFileScoped(ctx, reference, format, filePath, "book."+format)
 }
 
-// UploadFileNamedScoped is the source-name-preserving scoped upload path used
-// by automation.
+// UploadFileNamedScoped preserves the source filename during upload.
 func (c *Client) UploadFileNamedScoped(ctx context.Context, reference BookReference, format, filePath, filename string) error {
 	if err := reference.validate(); err != nil {
 		return err

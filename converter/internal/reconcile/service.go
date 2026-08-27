@@ -707,10 +707,8 @@ type DerivativePlan struct {
 	GenerationFingerprint string
 }
 
-// PlanDerivatives is pure policy: only configured outputs are considered. An
-// existing derivative is rebuilt when its persistent checkpoint is absent or
-// incomplete; an unknown remote timestamp is only preserved once the complete
-// hash/ID/generation checkpoint establishes that the service owns it.
+// PlanDerivatives returns actions for configured outputs. Existing derivatives
+// are preserved only when their complete checkpoint establishes ownership.
 func PlanDerivatives(files []grimmory.File, outputs []string, mainFormat, canonicalSHA string, saved map[string]state.DerivedState, canonicalMTime time.Time, canonicalTrusted, canonicalRecreated, force, bookCheckpointComplete bool, desiredFingerprints map[string]string) []DerivativePlan {
 	result := make([]DerivativePlan, 0, len(outputs))
 	for _, format := range outputs {
@@ -789,10 +787,8 @@ func derivativePlan(format, action, reason string, desiredFingerprints map[strin
 
 const generationFingerprintVersion = "v1"
 
-// DesiredGenerationFingerprints returns one deterministic generation
-// checkpoint per configured output. The target policy is intentionally
-// explicit: formats without a metadata projection only depend on content,
-// output name, and target format.
+// DesiredGenerationFingerprints returns a deterministic checkpoint for each
+// configured output, including target-specific material metadata.
 func DesiredGenerationFingerprints(book grimmory.Book, canonicalSHA, sourceName string, outputs []string) map[string]string {
 	result := make(map[string]string, len(outputs))
 	for _, format := range outputs {
@@ -805,9 +801,8 @@ func DesiredGenerationFingerprints(book grimmory.Book, canonicalSHA, sourceName 
 	return result
 }
 
-// GenerationFingerprint is the versioned identity of one desired output. The
-// canonical content hash and desired filename are common to every target;
-// only formats with a metadata policy receive a material metadata projection.
+// GenerationFingerprint returns the versioned identity of a desired output
+// from its content, filename, target format, and material target metadata.
 func GenerationFingerprint(book grimmory.Book, canonicalSHA, sourceName, targetFormat string) string {
 	targetFormat = normalizeFormat(targetFormat)
 	projection := generationFingerprintProjection{
@@ -987,10 +982,9 @@ func (s *Service) upload(ctx context.Context, reference grimmory.BookReference, 
 	return s.client.UploadFileNamedScoped(ctx, reference, format, filePath, desiredOutputName(sourceName, format))
 }
 
-// prepareDerivativeReplacement takes the destructive step only for a planned
-// rebuild. The inventory is refreshed through the library-scoped endpoint just
-// before deletion, so a target that disappeared after planning is treated as
-// an ordinary upload. The delete is deliberately not attempted for creates.
+// prepareDerivativeReplacement refreshes inventory before deleting a rebuild
+// target. A target missing at delete time is safe to replace; creates never
+// delete.
 func (s *Service) prepareDerivativeReplacement(ctx context.Context, reference grimmory.BookReference, format, mainFormat, canonicalFileID string) (grimmory.File, bool, error) {
 	current, err := s.client.GetLibraryBook(ctx, reference.LibraryID, reference.BookID)
 	if err != nil {
@@ -1103,7 +1097,7 @@ func verifyUploadedFile(before grimmory.File, hadBefore bool, after grimmory.Fil
 	return nil
 }
 
-// SelectSource chooses the first configured format, not the first API file.
+// SelectSource uses configured format order rather than API order.
 func SelectSource(files []grimmory.File, mainFormat string, allowed []string) (grimmory.File, bool) {
 	for _, format := range allowed {
 		format = normalizeFormat(format)

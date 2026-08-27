@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	// MaxInputBytes is the safe default used when the configured limit is absent.
+	// MaxInputBytes is the default safe input size limit.
 	MaxInputBytes      int64 = 100 << 20
 	maxDiagnosticBytes       = 2048
 )
@@ -26,8 +26,7 @@ var (
 	ErrOutputMissing  = errors.New("converter did not create output")
 )
 
-// Executor abstracts process execution so conversion behavior can be tested
-// without installing Calibre.
+// Executor runs a conversion command, allowing tests to avoid installing Calibre.
 type Executor interface {
 	Execute(ctx context.Context, executable string, args ...string) error
 }
@@ -134,8 +133,7 @@ func NewFileConverter(executable string, maxBytes int64, executor Executor) *Fil
 	return &FileConverter{executable: executable, executor: executor, maxBytes: maxBytes}
 }
 
-// Convert writes one Calibre result into workDir and returns its private path.
-// The caller owns cleanup of workDir.
+// Convert writes one Calibre result to workDir; the caller owns cleanup.
 func (c *FileConverter) Convert(ctx context.Context, inputPath, source, target, workDir string) (string, error) {
 	if c == nil || c.executor == nil || c.executable == "" {
 		return "", errors.New("file converter is not initialized")
@@ -202,8 +200,7 @@ func (c *FileConverter) Convert(ctx context.Context, inputPath, source, target, 
 	return outputPath, nil
 }
 
-// HashFile validates a file and calculates its SHA-256 without reading more
-// than maxBytes. It is used immediately before every upload.
+// HashFile validates and hashes a file within maxBytes before upload.
 func HashFile(filePath string, maxBytes int64) (string, int64, error) {
 	if err := verifyRegularFile(filePath, maxBytes); err != nil {
 		return "", 0, err
