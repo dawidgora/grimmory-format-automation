@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"converter/internal/grimmory"
 	"converter/internal/logging"
@@ -79,12 +80,15 @@ func endpointServer(t *testing.T) *Server {
 func endpointServerWithLogger(t *testing.T, remote reconcile.Remote, logger *logging.Logger) *Server {
 	t.Helper()
 	service := reconcile.New(reconcile.Options{
-		Client:          remote,
-		Store:           endpointStore{},
-		Converter:       endpointConverter{},
-		LibraryIDs:      []string{"1"},
-		OutputFormats:   []string{"mobi", "azw3"},
-		SupportedInputs: []string{"epub", "mobi", "azw3"},
+		Client:             remote,
+		Store:              endpointStore{},
+		Converter:          endpointConverter{},
+		LibraryIDs:         []string{"1"},
+		OutputFormats:      []string{"mobi", "azw3"},
+		SupportedInputs:    []string{"epub", "mobi", "azw3"},
+		MaxConcurrentBooks: 1,
+		MaxFileBytes:       1 << 20,
+		ConversionTimeout:  10 * time.Minute,
 	})
 	return NewWithLogger("secret", service, logger)
 }

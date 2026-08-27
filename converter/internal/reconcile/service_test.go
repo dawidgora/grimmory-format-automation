@@ -253,7 +253,7 @@ func TestPlanDerivativesHandlesMissingHashStaleTimestampAndForce(t *testing.T) {
 	}
 	plans := PlanDerivatives(files, []string{"mobi", "azw3", "epub"}, "epub", "new", map[string]state.DerivedState{
 		"mobi": complete("mobi", "old", "mobi-output"), "azw3": complete("azw3", "new", "azw3-output"),
-	}, canonicalTime, true, false, false, true)
+	}, canonicalTime, true, false, false, true, nil)
 	if plans[0].Action != "rebuild" || plans[0].Reason != "canonical_hash_changed" {
 		t.Fatalf("hash plan = %+v", plans[0])
 	}
@@ -262,11 +262,11 @@ func TestPlanDerivativesHandlesMissingHashStaleTimestampAndForce(t *testing.T) {
 	}
 	fromState := PlanDerivatives([]grimmory.File{{Format: "azw3", Name: "azw3"}}, []string{"azw3"}, "epub", "new", map[string]state.DerivedState{
 		"azw3": {BookID: "book", Format: "azw3", GrimmoryFileID: "file", SourceSHA256: "new", OutputSHA256: "output", TrustedMTime: canonicalTime.Add(-time.Hour), HasMTime: true, GeneratedAt: generated},
-	}, canonicalTime, true, false, false, true)
+	}, canonicalTime, true, false, false, true, nil)
 	if fromState[0].Reason != "trusted_timestamp_stale" {
 		t.Fatalf("stored timestamp plan = %+v", fromState[0])
 	}
-	forced := PlanDerivatives(files, []string{"mobi", "azw3"}, "epub", "new", nil, canonicalTime, true, false, true, true)
+	forced := PlanDerivatives(files, []string{"mobi", "azw3"}, "epub", "new", nil, canonicalTime, true, false, true, true, nil)
 	if forced[0].Reason != "forced" || forced[1].Reason != "forced" {
 		t.Fatalf("force plans = %+v", forced)
 	}
@@ -274,13 +274,13 @@ func TestPlanDerivativesHandlesMissingHashStaleTimestampAndForce(t *testing.T) {
 
 func TestPlanDerivativesRebuildsMissingOrIncompletePersistentState(t *testing.T) {
 	files := []grimmory.File{{Format: "mobi", Name: "book.mobi"}}
-	missing := PlanDerivatives(files, []string{"mobi"}, "epub", "sha", nil, time.Time{}, false, false, false, true)
+	missing := PlanDerivatives(files, []string{"mobi"}, "epub", "sha", nil, time.Time{}, false, false, false, true, nil)
 	if missing[0].Action != "rebuild" || missing[0].Reason != "state_missing" {
 		t.Fatalf("missing state plan = %+v", missing)
 	}
 	incomplete := PlanDerivatives(files, []string{"mobi"}, "epub", "sha", map[string]state.DerivedState{
 		"mobi": {BookID: "book", Format: "mobi", SourceSHA256: "sha"},
-	}, time.Time{}, false, false, false, true)
+	}, time.Time{}, false, false, false, true, nil)
 	if incomplete[0].Action != "rebuild" || incomplete[0].Reason != "state_incomplete" {
 		t.Fatalf("incomplete state plan = %+v", incomplete)
 	}
@@ -360,7 +360,7 @@ func TestSyncCreatesMissingMainThenCanonicalDerivativesAndCleansWorkspace(t *tes
 	remote := &fakeRemote{book: grimmory.Book{ID: "book", Files: []grimmory.File{{ID: "source-id", Format: "mobi", Name: "source.mobi"}}}, content: map[string][]byte{"mobi": []byte("source")}}
 	store := &memoryStore{derived: make(map[string]state.DerivedState)}
 	converter := &fakeConverter{}
-	service := New(Options{Client: remote, Store: store, Converter: converter, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi", "azw3"}, SupportedInputs: []string{"epub", "azw3", "mobi"}, FailedProcessingTag: "failed", MaxFileBytes: 1 << 20, TempRoot: tempRoot})
+	service := New(Options{Client: remote, Store: store, Converter: converter, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi", "azw3"}, SupportedInputs: []string{"epub", "azw3", "mobi"}, MaxConcurrentBooks: 1, FailedProcessingTag: "failed", MaxFileBytes: 1 << 20, ConversionTimeout: 10 * time.Minute, TempRoot: tempRoot})
 	result, err := service.Sync(context.Background(), "1", "book", SyncOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -397,7 +397,7 @@ func TestSyncCreatesMissingMainThenCanonicalDerivativesAndCleansWorkspace(t *tes
 
 func TestSyncDryRunDoesNotDownloadConvertOrUpload(t *testing.T) {
 	remote := &fakeRemote{book: grimmory.Book{ID: "book", Files: []grimmory.File{{Format: "epub", Name: "book.epub"}, {Format: "mobi", Name: "book.mobi"}}}, content: map[string][]byte{"epub": []byte("main")}}
-	service := New(Options{Client: remote, Store: &memoryStore{derived: map[string]state.DerivedState{}}, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}})
+	service := New(Options{Client: remote, Store: &memoryStore{derived: map[string]state.DerivedState{}}, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}, MaxConcurrentBooks: 1, MaxFileBytes: 1 << 20, ConversionTimeout: 10 * time.Minute})
 	result, err := service.Sync(context.Background(), "1", "book", SyncOptions{DryRun: true, Force: true})
 	if err != nil || result.Status != "dry_run" || result.Derivatives[0].Reason != "forced" {
 		t.Fatalf("dry run result=%+v err=%v", result, err)
@@ -419,7 +419,7 @@ func TestSyncRebuildDeletesExactDerivativeBeforeConflictUpload(t *testing.T) {
 		rejectOld: true,
 	}
 	store := &memoryStore{derived: map[string]state.DerivedState{}}
-	service := New(Options{Client: remote, Store: store, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}, TempRoot: t.TempDir()})
+	service := New(Options{Client: remote, Store: store, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}, MaxConcurrentBooks: 1, MaxFileBytes: 1 << 20, ConversionTimeout: 10 * time.Minute, TempRoot: t.TempDir()})
 	result, err := service.Sync(context.Background(), "1", "book", SyncOptions{Force: true})
 	if err != nil || result.Status != "completed" {
 		t.Fatalf("replacement result=%+v err=%v", result, err)
@@ -451,7 +451,7 @@ func TestSyncProtectsPrimaryAndAmbiguousDerivativeInventories(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			remote := &fakeRemote{book: grimmory.Book{ID: "book", Files: test.files}, content: map[string][]byte{"epub": []byte("main")}}
-			service := New(Options{Client: remote, Store: &memoryStore{derived: map[string]state.DerivedState{}}, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}, TempRoot: t.TempDir()})
+			service := New(Options{Client: remote, Store: &memoryStore{derived: map[string]state.DerivedState{}}, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}, MaxConcurrentBooks: 1, MaxFileBytes: 1 << 20, ConversionTimeout: 10 * time.Minute, TempRoot: t.TempDir()})
 			result, err := service.Sync(context.Background(), "1", "book", SyncOptions{Force: true})
 			if !errors.Is(err, ErrPartial) || result.Status != "partial" {
 				t.Fatalf("unsafe replacement result=%+v err=%v", result, err)
@@ -476,7 +476,7 @@ func TestSyncStopsAfterDerivativeDeleteFailure(t *testing.T) {
 		content:     map[string][]byte{"epub": []byte("main")},
 		deleteError: errors.New("delete failed"),
 	}
-	service := New(Options{Client: remote, Store: &memoryStore{derived: map[string]state.DerivedState{}}, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}, TempRoot: t.TempDir()})
+	service := New(Options{Client: remote, Store: &memoryStore{derived: map[string]state.DerivedState{}}, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}, MaxConcurrentBooks: 1, MaxFileBytes: 1 << 20, ConversionTimeout: 10 * time.Minute, TempRoot: t.TempDir()})
 	result, err := service.Sync(context.Background(), "1", "book", SyncOptions{Force: true})
 	if !errors.Is(err, ErrPartial) || result.Status != "partial" {
 		t.Fatalf("delete failure result=%+v err=%v", result, err)
@@ -506,7 +506,7 @@ func TestSyncDoesNotPersistAfterDerivativeUploadOrVerificationFailure(t *testing
 				uploadNoop:  test.uploadNoop,
 			}
 			store := &memoryStore{derived: map[string]state.DerivedState{}}
-			service := New(Options{Client: remote, Store: store, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}, TempRoot: t.TempDir()})
+			service := New(Options{Client: remote, Store: store, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}, MaxConcurrentBooks: 1, MaxFileBytes: 1 << 20, ConversionTimeout: 10 * time.Minute, TempRoot: t.TempDir()})
 			result, err := service.Sync(context.Background(), "1", "book", SyncOptions{Force: true})
 			if !errors.Is(err, ErrPartial) || result.Status != "partial" {
 				t.Fatalf("failure result=%+v err=%v", result, err)
@@ -537,7 +537,7 @@ func TestSyncContinuesWhenPlannedDerivativeDisappearsBeforeDelete(t *testing.T) 
 		content:    map[string][]byte{"epub": []byte("main")},
 		deleteGone: true,
 	}
-	service := New(Options{Client: remote, Store: &memoryStore{derived: map[string]state.DerivedState{}}, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}, TempRoot: t.TempDir()})
+	service := New(Options{Client: remote, Store: &memoryStore{derived: map[string]state.DerivedState{}}, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}, MaxConcurrentBooks: 1, MaxFileBytes: 1 << 20, ConversionTimeout: 10 * time.Minute, TempRoot: t.TempDir()})
 	result, err := service.Sync(context.Background(), "1", "book", SyncOptions{Force: true})
 	if err != nil || result.Status != "completed" {
 		t.Fatalf("disappeared derivative result=%+v err=%v", result, err)
@@ -550,7 +550,7 @@ func TestSyncReportsFailureTagMutationFailure(t *testing.T) {
 		content:  map[string][]byte{"epub": []byte("main")},
 		tagError: errors.New("tag endpoint unavailable"),
 	}
-	service := New(Options{Client: remote, Store: &memoryStore{derived: make(map[string]state.DerivedState)}, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, SupportedInputs: []string{"epub"}, FailedProcessingTag: "failed"})
+	service := New(Options{Client: remote, Store: &memoryStore{derived: make(map[string]state.DerivedState)}, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, SupportedInputs: []string{"epub"}, MaxConcurrentBooks: 1, MaxFileBytes: 1 << 20, ConversionTimeout: 10 * time.Minute, FailedProcessingTag: "failed"})
 	result, err := service.Sync(context.Background(), "1", "book", SyncOptions{})
 	if !errors.Is(err, ErrFailureTagMutation) || result.Status != "partial" || result.Error != "failure_tag_failed" {
 		t.Fatalf("failure tag result=%+v err=%v", result, err)
@@ -562,7 +562,7 @@ func TestSyncPreservesDerivativeStateWhenStateWriteFails(t *testing.T) {
 	lastSuccess := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
 	remote := &fakeRemote{book: grimmory.Book{ID: "book", Files: []grimmory.File{{Format: "epub", Name: "book.epub"}, {Format: "mobi", Name: "book.mobi"}}}, content: map[string][]byte{"epub": []byte("new-main")}}
 	store := &memoryStore{book: state.BookState{BookID: "book", MainFormat: "epub", CanonicalFormat: "epub", CanonicalFileID: "old-main", CanonicalFileName: "book.epub", CanonicalSHA256: "old", LastSuccessfulSync: lastSuccess}, derived: map[string]state.DerivedState{"mobi": old}, setDerError: errors.New("database unavailable")}
-	service := New(Options{Client: remote, Store: store, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}})
+	service := New(Options{Client: remote, Store: store, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}, MaxConcurrentBooks: 1, MaxFileBytes: 1 << 20, ConversionTimeout: 10 * time.Minute})
 	result, err := service.Sync(context.Background(), "1", "book", SyncOptions{})
 	if !errors.Is(err, ErrPartial) || result.Status != "partial" {
 		t.Fatalf("state failure result=%+v err=%v", result, err)
@@ -580,7 +580,7 @@ func TestSyncPreservesDerivativeStateWhenStateWriteFails(t *testing.T) {
 
 func TestSyncSerializesSameBook(t *testing.T) {
 	remote := &lockingRemote{book: grimmory.Book{ID: "book", Files: []grimmory.File{{Format: "epub", Name: "book.epub"}}}, started: make(chan struct{}), secondStarted: make(chan struct{}), release: make(chan struct{})}
-	service := New(Options{Client: remote, Store: &memoryStore{derived: map[string]state.DerivedState{}}, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}})
+	service := New(Options{Client: remote, Store: &memoryStore{derived: map[string]state.DerivedState{}}, Converter: &fakeConverter{}, LibraryIDs: []string{"1"}, OutputFormats: []string{"mobi"}, SupportedInputs: []string{"epub"}, MaxConcurrentBooks: 1, MaxFileBytes: 1 << 20, ConversionTimeout: 10 * time.Minute})
 	results := make(chan error, 2)
 	go func() {
 		_, err := service.Sync(context.Background(), "1", "book", SyncOptions{DryRun: true})

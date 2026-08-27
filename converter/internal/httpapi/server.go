@@ -28,10 +28,6 @@ type Server struct {
 
 var requestSequence uint64
 
-func New(apiKey string, service *reconcile.Service) *Server {
-	return NewWithLogger(apiKey, service, logging.New(logging.Info, nil))
-}
-
 func NewWithLogger(apiKey string, service *reconcile.Service, logger *logging.Logger) *Server {
 	if logger == nil {
 		logger = logging.New(logging.Info, nil)

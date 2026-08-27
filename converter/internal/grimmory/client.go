@@ -602,9 +602,9 @@ func (c *Client) getBookPage(ctx context.Context, pageNumber, pageSize int) (par
 const observationFingerprintVersion = "v1"
 
 // ObservationFingerprint returns the versioned digest of the stable book
-// observation used by future reconciliation. It deliberately excludes remote
-// timestamps, checksums, the legacy per-file metadata fingerprint, and fields
-// not represented in the normalized model.
+// observation. It deliberately excludes remote timestamps, checksums, the
+// per-file metadata fingerprint, and fields not represented in the normalized
+// model.
 func ObservationFingerprint(book Book) string {
 	projection := observationBookProjection{
 		BookID: strings.TrimSpace(book.ID),
@@ -1091,7 +1091,7 @@ func parseTokens(body []byte) (string, string, error) {
 		return "", "", fmt.Errorf("%w: decode Grimmory authentication response: %v", ErrInvalidResponse, err)
 	}
 	objects := []map[string]any{}
-	collectObjects(raw, &objects)
+	collectObjects(raw, &objects, []string{"data", "body", "result", "tokens"}, true)
 	var access, refresh string
 	for _, object := range objects {
 		if access == "" {
@@ -1107,25 +1107,28 @@ func parseTokens(body []byte) (string, string, error) {
 	return access, refresh, nil
 }
 
-func collectObjects(value any, result *[]map[string]any) {
+func collectObjects(value any, result *[]map[string]any, envelopeKeys []string, descendArrays bool) {
 	switch object := value.(type) {
 	case map[string]any:
 		*result = append(*result, object)
-		for _, key := range []string{"data", "body", "result", "tokens"} {
+		for _, key := range envelopeKeys {
 			if nested, ok := object[key]; ok {
-				collectObjects(nested, result)
+				collectObjects(nested, result, envelopeKeys, descendArrays)
 			}
 		}
 	case []any:
+		if !descendArrays {
+			return
+		}
 		for _, nested := range object {
-			collectObjects(nested, result)
+			collectObjects(nested, result, envelopeKeys, descendArrays)
 		}
 	}
 }
 
 func parseBook(value any, fallbackID string) (Book, bool) {
 	objects := []map[string]any{}
-	collectBookObjects(value, &objects)
+	collectObjects(value, &objects, []string{"book", "data", "body", "result"}, false)
 	for _, object := range objects {
 		files, ok := parseBookFiles(object)
 		if !ok {
@@ -1669,19 +1672,6 @@ func parseLiveFiles(object map[string]any) ([]File, bool) {
 	}
 	sortFiles(files)
 	return files, true
-}
-
-func collectBookObjects(value any, result *[]map[string]any) {
-	object, ok := value.(map[string]any)
-	if !ok {
-		return
-	}
-	*result = append(*result, object)
-	for _, key := range []string{"book", "data", "body", "result"} {
-		if nested, exists := object[key]; exists {
-			collectBookObjects(nested, result)
-		}
-	}
 }
 
 func parseFiles(value any) ([]File, bool) {

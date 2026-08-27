@@ -225,21 +225,6 @@ type bookLockContext struct {
 }
 
 func New(options Options) *Service {
-	maxBytes := options.MaxFileBytes
-	if maxBytes <= 0 {
-		maxBytes = convert.MaxInputBytes
-	}
-	timeout := options.ConversionTimeout
-	if timeout <= 0 {
-		timeout = 10 * time.Minute
-	}
-	concurrency := options.MaxConcurrentBooks
-	if concurrency < 1 {
-		concurrency = 1
-	}
-	if concurrency > 16 {
-		concurrency = 16
-	}
 	allowed := make(map[string]struct{}, len(options.LibraryIDs))
 	for _, libraryID := range options.LibraryIDs {
 		if ValidLibraryID(libraryID) {
@@ -249,9 +234,9 @@ func New(options Options) *Service {
 	return &Service{
 		client: options.Client, store: options.Store, converter: options.Converter,
 		outputs: normalizeFormats(options.OutputFormats, "", false),
-		inputs:  normalizeFormats(options.SupportedInputs, "", false), maxFileBytes: maxBytes,
-		conversionTimeout: timeout, tempRoot: options.TempRoot, logger: options.Logger, failedTag: strings.TrimSpace(options.FailedProcessingTag),
-		locks: make(map[string]*bookLock), limiter: make(chan struct{}, concurrency), allowedLibraries: allowed,
+		inputs:  normalizeFormats(options.SupportedInputs, "", false), maxFileBytes: options.MaxFileBytes,
+		conversionTimeout: options.ConversionTimeout, tempRoot: options.TempRoot, logger: options.Logger, failedTag: strings.TrimSpace(options.FailedProcessingTag),
+		locks: make(map[string]*bookLock), limiter: make(chan struct{}, options.MaxConcurrentBooks), allowedLibraries: allowed,
 	}
 }
 
@@ -725,14 +710,8 @@ type DerivativePlan struct {
 // PlanDerivatives is pure policy: only configured outputs are considered. An
 // existing derivative is rebuilt when its persistent checkpoint is absent or
 // incomplete; an unknown remote timestamp is only preserved once the complete
-// hash/ID/generation checkpoint establishes that the service owns it. The
-// optional generationFingerprints argument keeps the pre-fingerprint API
-// compatible for callers that only need the legacy content policy.
-func PlanDerivatives(files []grimmory.File, outputs []string, mainFormat, canonicalSHA string, saved map[string]state.DerivedState, canonicalMTime time.Time, canonicalTrusted, canonicalRecreated, force, bookCheckpointComplete bool, generationFingerprints ...map[string]string) []DerivativePlan {
-	var desiredFingerprints map[string]string
-	if len(generationFingerprints) > 0 {
-		desiredFingerprints = generationFingerprints[0]
-	}
+// hash/ID/generation checkpoint establishes that the service owns it.
+func PlanDerivatives(files []grimmory.File, outputs []string, mainFormat, canonicalSHA string, saved map[string]state.DerivedState, canonicalMTime time.Time, canonicalTrusted, canonicalRecreated, force, bookCheckpointComplete bool, desiredFingerprints map[string]string) []DerivativePlan {
 	result := make([]DerivativePlan, 0, len(outputs))
 	for _, format := range outputs {
 		format = normalizeFormat(format)
@@ -1023,11 +1002,23 @@ func (s *Service) prepareDerivativeReplacement(ctx context.Context, reference gr
 	if current.LibraryID != reference.LibraryID {
 		return grimmory.File{}, false, grimmory.ErrBookNotInLibrary
 	}
-	existing, exists, err := exactFile(current.Files, format)
-	if err != nil || !exists {
-		return existing, exists, err
+	format = normalizeFormat(format)
+	if format == "" {
+		return grimmory.File{}, false, ErrAmbiguousFile
 	}
-	if normalizeFormat(format) == normalizeFormat(mainFormat) {
+	existingFiles := filesForFormat(current.Files, format)
+	switch len(existingFiles) {
+	case 0:
+		return grimmory.File{}, false, nil
+	case 1:
+		if existingFiles[0].ID == "" {
+			return grimmory.File{}, false, ErrAmbiguousFile
+		}
+	default:
+		return grimmory.File{}, false, ErrAmbiguousFile
+	}
+	existing := existingFiles[0]
+	if format == normalizeFormat(mainFormat) {
 		return grimmory.File{}, false, ErrPrimaryFile
 	}
 	primaryFiles := filesForFormat(current.Files, mainFormat)
@@ -1076,29 +1067,6 @@ func missingDerivativeFile(err error) bool {
 		return true
 	}
 	return httpErr.Operation == "delete" || httpErr.Operation == "file delete"
-}
-
-func exactFile(files []grimmory.File, format string) (grimmory.File, bool, error) {
-	format = normalizeFormat(format)
-	if format == "" {
-		return grimmory.File{}, false, ErrAmbiguousFile
-	}
-	var selected grimmory.File
-	matches := 0
-	for _, file := range files {
-		if normalizeFormat(file.Format) != format {
-			continue
-		}
-		selected = file
-		matches++
-	}
-	if matches == 0 {
-		return grimmory.File{}, false, nil
-	}
-	if matches != 1 || selected.ID == "" {
-		return grimmory.File{}, false, ErrAmbiguousFile
-	}
-	return selected, true, nil
 }
 
 func filesForFormat(files []grimmory.File, format string) []grimmory.File {
