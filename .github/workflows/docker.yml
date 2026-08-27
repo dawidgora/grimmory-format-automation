@@ -75,6 +75,7 @@ jobs:
             -e GRIMMORY_BASE_URL=http://127.0.0.1:9999 \
             -e GRIMMORY_USERNAME=smoke-user \
             -e GRIMMORY_PASSWORD=smoke-password \
+            -e LIBRARY_IDS=1 \
             "${SMOKE_IMAGE}"
           trap 'docker rm --force grimmory-format-service-smoke >/dev/null 2>&1 || true' EXIT
 
