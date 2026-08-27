@@ -1,8 +1,7 @@
 # Deployment examples
 
-The runnable examples are the root [`docker-compose.yml`](../docker-compose.yml)
-and the single-service manifests in [`../kubernetes/`](../kubernetes/). They
-connect to an existing Grimmory deployment over HTTP and do not install
+The runnable example is the root [`docker-compose.yml`](../docker-compose.yml).
+It connects to an existing Grimmory deployment over HTTP and does not install
 Grimmory or provide a local library directory.
 
 ## Compose
@@ -56,31 +55,6 @@ http POST http://127.0.0.1:8080/sync/LIBRARY_ID/BOOK_ID \
   "Authorization:Bearer ${API_KEY}" \
   dryRun:=false force:=false
 ```
-
-## Kubernetes
-
-The manifests are one Deployment, one internal ClusterIP Service, one PVC for
-`/data`, and one example Secret. Replace the image owner, pin an immutable
-image tag, select a StorageClass, and use an external or sealed Secret for
-production. The example Secret's `API_KEY` is only the service's inbound
-bearer key. Remove that key to let the persistent `/data` claim generate one.
-
-```sh
-kubectl create namespace grimmory-automation --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n grimmory-automation apply -f ../kubernetes/secret.example.yaml
-kubectl -n grimmory-automation apply -f ../kubernetes/pvc-example.yaml
-kubectl -n grimmory-automation apply -f ../kubernetes/service.yaml
-kubectl -n grimmory-automation apply -f ../kubernetes/deployment.yaml
-```
-
-Retrieve a generated key only with appropriate cluster access:
-
-```sh
-kubectl -n grimmory-automation exec deploy/grimmory-format-service -- cat /data/api-key
-```
-
-The service is not externally published by these examples. Add an
-authenticated HTTPS gateway and network policy before exposing it.
 
 ## Grimmory contract check
 

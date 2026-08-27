@@ -256,24 +256,6 @@ Do not publish the service directly to an untrusted network. Set an explicit
 key retrieval shown above. Configure the target Grimmory URL and credential
 with runtime secret injection appropriate to the sync server.
 
-### Kubernetes
-
-The manifests in [`kubernetes/`](kubernetes/) are examples for the same single
-service: one Deployment, ClusterIP Service, `/data` PVC, and example Secret.
-Replace the image owner, pin an immutable image tag, select a StorageClass, and
-use an external or sealed Secret in production.
-
-```sh
-kubectl create namespace grimmory-automation --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n grimmory-automation apply -f kubernetes/secret.example.yaml
-kubectl -n grimmory-automation apply -f kubernetes/pvc-example.yaml
-kubectl -n grimmory-automation apply -f kubernetes/service.yaml
-kubectl -n grimmory-automation apply -f kubernetes/deployment.yaml
-```
-
-The Service is internal by default. Add an authenticated HTTPS gateway only
-after applying network policy and secret management appropriate to the cluster.
-
 ## Scope and exclusions
 
 - Polling is opt-in at the binary CLI; its fixed worker pool and manual HTTP
