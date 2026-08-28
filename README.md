@@ -37,6 +37,7 @@ services:
   grimmory-format-service:
     image: ghcr.io/dawidgora/grimmory-format-automation:latest
     restart: unless-stopped
+    stop_grace_period: 31m
     # Remove `command: ["--poll"]` for manual-only operation.
     command: ["--poll"]
     ports:
@@ -56,6 +57,11 @@ services:
 volumes:
   converter_data:
 ```
+
+Both Compose files publish the API on the configured host port and allow 31
+minutes for graceful shutdown. Adjust the host binding to choose network
+exposure. This covers three sequential 10-minute conversions and 30 seconds for
+HTTP shutdown.
 
 - Start the service:
 
@@ -115,7 +121,7 @@ and timeouts, such as `30s`, `1m`, or `1h`.
 | `DATA_DIR` | `/data` | Directory for SQLite state and the generated key. |
 | `CALIBRE_BINARY` | `ebook-convert` | Executable name or path for Calibre. |
 | `LOG_LEVEL` | `info` | Use `debug`, `info`, `warn`, `warning`, or `error`. |
-| `GRIMMORY_BASE_URL` | required | Required absolute `http` or `https` URL for Grimmory. |
+| `GRIMMORY_BASE_URL` | required | Accepts an absolute HTTP or HTTPS URL for Grimmory. |
 | `GRIMMORY_USERNAME` | required | Required Grimmory account name. |
 | `GRIMMORY_PASSWORD` | required | Required Grimmory credential. |
 | `LIBRARY_IDS` | required | Required comma-separated list of library IDs. |
@@ -133,3 +139,6 @@ and timeouts, such as `30s`, `1m`, or `1h`.
 | `POLL_MAX_ATTEMPTS` | `5` | Poll attempts per book: `1`–`1000`. |
 | `POLL_RETRY_BASE` | `30s` | Initial retry delay: `1ms`–`24h`; it must not exceed `POLL_RETRY_MAX`. |
 | `POLL_RETRY_MAX` | `15m` | Maximum retry delay: `1ms`–`168h`; it must not be below `POLL_RETRY_BASE`. |
+
+- `IGNORE_PROCESSING_TAG` and `FAILED_PROCESSING_TAG` must differ when both are
+  non-empty. Identical values fail startup.

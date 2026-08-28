@@ -128,6 +128,65 @@ func TestConfigurationRequiresGrimmoryCredentialsAndRejectsUnsafeFormats(t *test
 	}
 }
 
+func TestProcessingTagsMustDifferWhenBothAreSet(t *testing.T) {
+	tests := []struct {
+		name      string
+		ignoreTag string
+		failedTag string
+		wantError bool
+	}{
+		{name: "both empty", wantError: false},
+		{name: "only ignore tag", ignoreTag: "processing", wantError: false},
+		{name: "only failed tag", failedTag: "failed", wantError: false},
+		{name: "different tags", ignoreTag: "processing", failedTag: "failed", wantError: false},
+		{name: "identical tags", ignoreTag: "processing", failedTag: "processing", wantError: true},
+		{name: "identical after trimming", ignoreTag: " processing ", failedTag: "processing", wantError: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("GRIMMORY_BASE_URL", "https://grimmory.example")
+			t.Setenv("GRIMMORY_USERNAME", "user")
+			t.Setenv("GRIMMORY_PASSWORD", "password")
+			t.Setenv("LIBRARY_IDS", "1")
+			t.Setenv("IGNORE_PROCESSING_TAG", test.ignoreTag)
+			t.Setenv("FAILED_PROCESSING_TAG", test.failedTag)
+
+			_, err := Load()
+			if (err != nil) != test.wantError {
+				t.Fatalf("Load() error = %v, wantError = %v", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestBaseURLAcceptsHTTPAndHTTPS(t *testing.T) {
+	tests := []struct {
+		name    string
+		baseURL string
+		valid   bool
+	}{
+		{name: "https remote host", baseURL: "https://grimmory.example", valid: true},
+		{name: "http remote host", baseURL: "http://grimmory.example", valid: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("GRIMMORY_BASE_URL", test.baseURL)
+			t.Setenv("GRIMMORY_USERNAME", "user")
+			t.Setenv("GRIMMORY_PASSWORD", "password")
+			t.Setenv("LIBRARY_IDS", "1")
+
+			_, err := Load()
+			if (err == nil) != test.valid {
+				t.Fatalf("Load() error = %v, valid = %v", err, test.valid)
+			}
+		})
+	}
+}
+
 func TestBoundedSettingsRejectOutOfRangeValues(t *testing.T) {
 	clearConfigEnv(t)
 	t.Setenv("GRIMMORY_BASE_URL", "https://grimmory.example")

@@ -10,9 +10,11 @@ manual-only. Polling performs an immediate scan and uses a start-to-start
 ticker; ticks during a running scan are discarded.
 
 Required Grimmory settings are `GRIMMORY_BASE_URL`, `GRIMMORY_USERNAME`, and
-`GRIMMORY_PASSWORD`. `API_KEY` is optional; when unset, a random key is loaded
-from or generated at `$DATA_DIR/api-key` with mode `0600`. `DATA_DIR` defaults
-to `/data` and contains only `api-key` and `state.db`.
+`GRIMMORY_PASSWORD`. The service accepts an absolute HTTP or HTTPS URL for
+`GRIMMORY_BASE_URL`.
+`API_KEY` is optional; when unset,
+a random key is loaded from or generated at `$DATA_DIR/api-key` with mode `0600`.
+`DATA_DIR` defaults to `/data` and contains only `api-key` and `state.db`.
 
 `LIBRARY_IDS` is required and is a comma-separated integer allowlist. Format
 settings are `OUTPUT_FORMATS` (default `mobi,azw3`) and
@@ -24,7 +26,8 @@ validated before startup. Limits can be tuned with `MAX_FILE_BYTES`,
 `POLL_INTERVAL` (default `5m`), `POLL_MAX_ATTEMPTS` (default `5`),
 `POLL_RETRY_BASE` (default `30s`), and `POLL_RETRY_MAX` (default `15m`).
 They are validated at startup. `IGNORE_PROCESSING_TAG` and
-`FAILED_PROCESSING_TAG` are optional; blank disables each behavior.
+`FAILED_PROCESSING_TAG` are optional; a blank value disables each behavior.
+Identical non-empty values fail startup.
 `MAX_CONCURRENT_BOOKS` defaults to one and is bounded to 16.
 
 The service obtains a Grimmory token, reads one scoped library/book reference,

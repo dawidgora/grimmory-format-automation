@@ -93,6 +93,8 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	handlerCtx, cancelHandlers := context.WithCancel(context.Background())
+	defer cancelHandlers()
 	api := httpapi.NewWithLogger(apiKey, service, logger)
 	server := &http.Server{
 		Addr:              cfg.Addr,
@@ -102,7 +104,7 @@ func main() {
 		// Allow all sequential conversions in a valid one-book sync to complete.
 		WriteTimeout: 0,
 		IdleTimeout:  60 * time.Second,
-		BaseContext:  func(net.Listener) context.Context { return ctx },
+		BaseContext:  func(net.Listener) context.Context { return handlerCtx },
 	}
 
 	var pollWG sync.WaitGroup
@@ -125,6 +127,12 @@ func main() {
 		defer cancel()
 		if shutdownErr := server.Shutdown(shutdownCtx); shutdownErr != nil {
 			logger.Log(logging.Error, logging.Field{Key: "message", Value: "server shutdown"}, logging.Field{Key: "error", Value: shutdownErr.Error()})
+			if errors.Is(shutdownErr, context.DeadlineExceeded) {
+				cancelHandlers()
+				if closeErr := server.Close(); closeErr != nil {
+					logger.Log(logging.Error, logging.Field{Key: "message", Value: "server close"}, logging.Field{Key: "error", Value: closeErr.Error()})
+				}
+			}
 		}
 	}()
 

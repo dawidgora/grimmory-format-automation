@@ -110,6 +110,9 @@ func Load() (Config, error) {
 	}
 	ignoreTag := strings.TrimSpace(os.Getenv("IGNORE_PROCESSING_TAG"))
 	failedTag := strings.TrimSpace(os.Getenv("FAILED_PROCESSING_TAG"))
+	if ignoreTag != "" && ignoreTag == failedTag {
+		return Config{}, fmt.Errorf("IGNORE_PROCESSING_TAG and FAILED_PROCESSING_TAG must differ")
+	}
 	maxConcurrentBooks, err := boundedInt("MAX_CONCURRENT_BOOKS", defaultMaxConcurrentBooks, 1, 16)
 	if err != nil {
 		return Config{}, err

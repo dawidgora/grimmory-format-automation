@@ -8,6 +8,7 @@ services:
     image: ${CONVERTER_IMAGE:-grimmory-format-automation:local}
     command: ["--poll"]
     restart: unless-stopped
+    stop_grace_period: 31m
     init: true
     environment:
       # Leave API_KEY unset or blank to generate /data/api-key on first start.

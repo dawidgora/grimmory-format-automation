@@ -1,10 +1,14 @@
 # Deployment examples
 
 The runnable example is the root [`docker-compose.yml`](../docker-compose.yml).
-It connects to an existing Grimmory deployment over HTTP and does not install
-Grimmory or provide a local library directory.
+It connects to an existing Grimmory deployment over HTTP or HTTPS. The example
+does not install Grimmory or provide a local library directory.
 
 ## Compose
+
+Both Compose files publish the API on the configured host port and allow 31
+minutes for graceful shutdown. Adjust the host binding to choose network
+exposure.
 
 Start the Air development service:
 
