@@ -1,289 +1,117 @@
 # Grimmory Format Automation
 
-Grimmory Format Automation is a standalone, one-service Go application for
-manually reconciling ebook formats in an existing Grimmory installation. It
-uses Calibre for conversion and SQLite for durable reconciliation state.
-Grimmory remains the source of truth and is reached over its HTTP API. The
-service does not install Grimmory, contain its database, or use a `/books`
-directory.
+A single-replica Go service for reconciling ebook formats in Grimmory. Grimmory
+is the source of truth; the service uses its HTTP API, Calibre
+`ebook-convert`, and SQLite state under `/data`.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    Client[Operator or API client] -->|Bearer API key| Service[Go service :8080]
-    Service -->|deployed HTTP API| Grimmory[Existing Grimmory]
+    Operator[Operator] --> Service[Format service]
+    Service -->|HTTP API| Grimmory[Grimmory]
     Service -->|ebook-convert| Calibre[Calibre]
-    Service --> State[(Persistent /data\nSQLite state.db + service key)]
+    Service -->|SQLite| State[( /data state)]
 ```
 
-There is one application process. `/data` is the only persistent application
-path; it contains the generated service key and SQLite state, not a Grimmory
-library. Run one replica for a shared SQLite database and deterministic writes.
+## Installation
 
-## Service API
+### Docker Compose: manual
 
-| Method | Path | Authentication | Purpose |
-| --- | --- | --- | --- |
-| `GET` | `/health` | none | liveness/readiness |
-| `GET` | `/formats` | bearer service key | supported formats |
-| `POST` | `/sync/{libraryId}/{bookId}` | bearer service key | reconcile one Grimmory book |
-
-`/sync/{libraryId}/{bookId}` accepts optional `dryRun=true` and `force=true`
-query parameters. `libraryId` must be in the configured integer allowlist.
-The library's `formatPriority` selects the main format for this operation;
-fallbacks and outputs are then intersected with service and library policy.
-The optional `--poll` CLI flag also runs a background library scan while these
-endpoints remain available.
-
-## Manual sync
-
-Start the local Compose service and obtain its key. The default Compose
-workflow is non-polling:
-
-```sh
-# Provide these three values from a local ignored environment or a secret
-# manager before starting Compose; they are required for Grimmory sync.
-export GRIMMORY_BASE_URL='https://grimmory.example.invalid'
-export GRIMMORY_USERNAME='service-account'
-export GRIMMORY_PASSWORD='read-write-secret'
-export LIBRARY_IDS='1,2'
-docker compose up --build
-```
-
-In another terminal, obtain the generated key:
-
-```sh
-SERVICE_URL=http://127.0.0.1:8080
-API_KEY="$(docker compose exec -T grimmory-format-service cat /data/api-key)"
-```
-
-If `API_KEY` is explicitly configured, use that value
-instead of reading the generated key. Submit one book and the requested
-derived formats with curl:
-
-```sh
-curl --fail-with-body -X POST "${SERVICE_URL}/sync/LIBRARY_ID/BOOK_ID?dryRun=false&force=false" \
-  -H "Authorization: Bearer ${API_KEY}"
-```
-
-The same request with HTTPie is:
-
-```sh
-http POST "${SERVICE_URL}/sync/LIBRARY_ID/BOOK_ID?dryRun=false&force=false" \
-  "Authorization:Bearer ${API_KEY}"
-```
-
-The service key is separate from any Grimmory credential. With `API_KEY` unset
-or blank, the service generates a random key once and stores it as
-`/data/api-key` with mode `0600`. Keep the `/data` volume/PVC across upgrades;
-losing it loses a generated key and requires a key rotation. An explicit
-`API_KEY` is not written to the volume. Treat it as a password: inject it through an ignored local
-environment or a secret manager, never commit it, print it in CI, or put it in
-logs. Rotate an explicit key by replacing the secret and restarting the
-service; rotate a generated key by setting a new explicit key before restart.
-
-The sync process also needs the target Grimmory URL and least-privilege API
-credentials. Supply those through the configuration mechanism documented by
-the current Go server and a runtime Secret; never put them in the image or the
-sync request. The examples intentionally contain no credential values.
-
-## Configuration policy
-
-Only service configuration is accepted. There is no library-path setting and
-`/data` is the deployment location for state. Set one spelling of each alias;
-do not configure both forms at once.
-
-| Variable | Default | Constraint |
-| --- | --- | --- |
-| `API_KEY` | generated | non-empty value overrides generated key |
-| `CONVERTER_DATA_DIR` / `DATA_DIR` | `/data` | writable service-data directory; use `/data` in containers |
-| `CONVERTER_PORT` / `PORT` | `8080` | decimal `0`–`65535`; use `8080` for deployments |
-| `CONVERTER_CALIBRE_BINARY` / `CALIBRE_BINARY` | `ebook-convert` | executable path/name, not a shell command |
-| `CONVERTER_LOG_LEVEL` / `LOG_LEVEL` | `info` | one of `debug`, `info`, `warn`, `error` |
-| `GRIMMORY_BASE_URL` | none | required absolute `http` or `https` URL |
-| `GRIMMORY_USERNAME` | none | required non-empty Grimmory account name |
-| `GRIMMORY_PASSWORD` | none | required non-empty secret; inject at runtime |
-| `LIBRARY_IDS` | none | required comma-separated non-negative integer allowlist |
-| `OUTPUT_FORMATS` | `mobi,azw3` | non-empty comma/space-separated format tokens |
-| `SUPPORTED_INPUT_FORMATS` | `epub,mobi,azw3` | non-empty comma/space-separated format tokens |
-| `IGNORE_PROCESSING_TAG` | disabled | skip books carrying this exact tag when non-empty |
-| `FAILED_PROCESSING_TAG` | disabled | tag poll failures after retries are exhausted when non-empty |
-| `MAX_CONCURRENT_BOOKS` | `1` | integer from `1` through `16`; shared by manual and poll syncs |
-| `MAX_FILE_BYTES` | `100 MiB` | integer from `1` byte through `2 GiB` |
-| `MAX_RESPONSE_BYTES` | `8 MiB` | integer from `1` byte through `64 MiB` |
-| `HTTP_TIMEOUT` | `30s` | `1ms` through `10m` Go duration |
-| `CONVERSION_TIMEOUT` | `10m` | `1ms` through `2h` Go duration |
-| `DATABASE_BUSY_TIMEOUT` | `5s` | `0` through `1m` Go duration |
-| `POLL_INTERVAL` | `5m` | `1ms` through `24h`; Go duration syntax such as `30s`, `5m`, or `1h` |
-| `POLL_MAX_ATTEMPTS` | `5` | integer from `1` through `1000` |
-| `POLL_RETRY_BASE` | `30s` | `1ms` through `24h` Go duration |
-| `POLL_RETRY_MAX` | `15m` | `1ms` through `168h`, not below `POLL_RETRY_BASE` |
-
-Do not pass credentials on command lines where the process list can expose
-them. Use HTTPS for Grimmory outside a trusted local network, and put the
-service behind an authenticated TLS proxy when it is reachable beyond the
-private deployment network.
-
-`POLL_INTERVAL` accepts Go duration syntax, for example `30s`, `5m`, or `1h`.
-Polling schedules scans start-to-start: the interval is measured from one scan
-start to the next, and any tick received while a scan is running is skipped.
-
-## Reconciliation algorithm and state
-
-Each request is a single-book reconciliation. The deterministic policy is:
-
-1. Validate the library and book reference, read that library's immutable
-   policy, and select `formatPriority[0]` as main. Fallbacks are the remaining
-   priority entries intersected with `SUPPORTED_INPUT_FORMATS`; outputs are
-   `OUTPUT_FORMATS` intersected with `allowedFormats`. A null or empty
-   `allowedFormats` means unrestricted. The main format must be supported and
-   allowed.
-2. Read the scoped book metadata and file inventory from Grimmory's deployed
-   API. If the main format is absent, select the first available fallback; if
-   none exists, stop with `no_source`.
-   Never discover input by walking a local directory.
-3. Download the canonical source (or download and first convert the selected
-   fallback source when the canonical file is missing) and compute the
-   canonical SHA-256. For each configured output, plan `create` when missing
-   and `rebuild` when forced, when the canonical source was just created, when
-   the saved source hash differs, state is absent or incomplete, or when both
-   canonical and target mtimes are trusted and the target is older. A matching
-   fully tracked target is `unchanged`. Because the deployment has no atomic
-   replace operation, every rebuild of an existing derivative is reported as
-   `blocked` with `safe_replacement_unavailable`; it is never deleted or
-   overwritten. `dryRun` reports the same blocked rebuild plans without
-   writing, while missing derivatives remain creatable.
-4. For every planned missing output, invoke Calibre in a private temporary
-   directory, hash and size-check the result, and upload only a complete
-   validated file. Never delete the source or an existing derivative. When
-   creating a missing main from a configured output format, any existing
-   derivative is reported as blocked rather than replaced.
-5. Before each upload, persist a derived-upload intent containing the exact
-   source hash, output hash, generation fingerprint, and desired name. Verify
-   the upload by reading Grimmory again and confirming the requested format
-   exists and changed identity or matching remote hash proves the upload. Only
-   then commit the derivative and clear its intent in one transaction. If a
-   retry sees an existing target, it may adopt it only when the current intent,
-   expected name, exact output hash, and a single stable inventory candidate all
-   match; arbitrary remote files are never adopted. Conversion, download,
-   upload, verification, and state failures are reported per item; a request
-   with any derivative failure is `partial`, and partial output is never marked
-   current.
-
-The state database is `/data/state.db`, opened with the pure-Go
-`modernc.org/sqlite` driver. It uses `PRAGMA journal_mode=WAL`, foreign-key
-checks, a single database connection, and a busy timeout. It has four tables:
-`book_state` is keyed by `(library_id, book_id)` and stores `main_format`,
-`canonical_format`, canonical file ID/name, `canonical_sha256`, metadata
-fingerprint, an optional trusted canonical mtime, last-success timestamp, and
-`updated_at_ns`; `derived` is keyed by `(library_id, book_id, format)` and stores the
-uploaded Grimmory file ID, `source_sha256`, `output_sha256`, an optional
-target-aware generation fingerprint, optional trusted target mtime, generation
-timestamp, and `updated_at_ns`. `derived_upload_intent` is keyed by the same
-scope and format and retains the exact desired output name, source hash,
-output hash, and generation fingerprint until the matching derived row is
-committed. Derived rows are retained when the canonical source changes or a
-later operation fails, so the previous evidence is not discarded. A
-transaction records a derived row and clears its intent only after the
-post-upload read confirms the requested target. SQLite state is not a
-substitute for multi-replica distributed locking; the service is therefore
-deployed with one replica.
-
-With `--poll`, the service lists each configured library through its library
-endpoint, gets each book's scoped detail, and persists its stable observation.
-Only pending or due retry observations are sent through the same scoped `Sync`
-path using a fixed worker pool. Managed ignore/failure tags are excluded from
-observation fingerprints, so tags never change retry attempt semantics. A
-successful sync is followed by another live book read before the observation
-is marked applied/current. Retries use capped exponential jitter and are
-limited to transient network/timeouts, remote `408`/`425`/`429`/`5xx`, SQLite
-busy/locked, and eventual upload-visibility failures. There is deliberately
-no byte-only source change detection: a source byte change with no observable
-Grimmory API change is not discoverable by polling.
-
-## Grimmory API contract warning
-
-The algorithm above uses this **explicit assumption** for the write step:
-`POST /api/v1/books/{bookId}/files`, with the upload fields and response
-described by the deployment. That path is an assumption for the integration,
-not a claim about Grimmory's current public contract. Grimmory releases and
-installations can use different paths, authentication, multipart field names,
-version fields, or conflict behavior.
-
-Before enabling writes, fetch the target deployment's `GET /api/openapi.json`
-and verify the actual servers, security scheme, book/file read operations,
-source download, upload operation, request schema, response schema, and
-conflict semantics. If the deployed document does not describe the assumed
-operation, stop and configure the adapter for the documented contract; do not
-guess from this repository or a different Grimmory release.
-
-Metadata is deliberately limited: Grimmory metadata remains authoritative, but
-the service does not promise to preserve every custom field, series value,
-cover, or embedded metadata detail through Calibre. The integration tracks
-file identity and format state, not a metadata migration. Review a converted
-book and its metadata before broad use.
-
-## Deployment
-
-### Docker Compose
-
-Compose runs only `grimmory-format-service` and publishes port `8080`.
-
-The default workflow is non-polling:
+Set the required `GRIMMORY_BASE_URL`, `GRIMMORY_USERNAME`,
+`GRIMMORY_PASSWORD`, and `LIBRARY_IDS` variables, then run:
 
 ```sh
 docker compose up --build
 ```
 
-In another terminal, check that the service is ready:
+### Docker Compose: polling
 
-```sh
-curl --fail http://127.0.0.1:8080/health
-```
-
-For production-style polling, use the standalone Compose file. It invokes the
-binary entrypoint with `--poll` and keeps the service key and SQLite state in
-the persistent `converter_data` volume; it does not merge with the development
-file:
+Use the same required variables and run:
 
 ```sh
 docker compose -f docker-compose.poll.yml up -d --build
 ```
 
-Polling performs real reconciliation writes for due books. Verify the target
-Grimmory API contract and credentials before starting it. To inspect behavior
-without writes, use the manual endpoint's `dryRun=true`; the polling workflow
-itself is not a dry-run mode.
+### Direct local Go/Calibre run
 
-The Compose image runs the compiled service with Calibre and persists its
-state in the named `/data` volume. The polling Compose workflow uses the same
-image with `--poll` enabled.
+From `converter`, install Go and Calibre with `ebook-convert` available on
+`PATH`, set the required variables, then run either:
 
-Do not publish the service directly to an untrusted network. Set an explicit
-`API_KEY` through a local ignored environment or use the generated
-key retrieval shown above. Configure the target Grimmory URL and credential
-with runtime secret injection appropriate to the sync server.
+```sh
+go run ./cmd/server
+go run ./cmd/server --poll
+```
 
-## Scope and exclusions
+The second command enables polling.
 
-- Polling is opt-in at the binary CLI; its fixed worker pool and manual HTTP
-  sync share the `MAX_CONCURRENT_BOOKS` limiter.
-- Supported formats are EPUB input and MOBI/AZW3 derived output. PDF and KFX
-  are excluded, and DRM is never bypassed.
-- The project does not provide a Grimmory server, database, library backup,
-  metadata migration, or an ingress/TLS certificate.
-- Calibre conversion can be CPU- and storage-intensive. Test against a
-  disposable collection or reversible staging process before production use.
-- Keep backups of `/data` for state and generated-key recovery; ebook files are
-  transient request data and are not an archival store.
+## Usage
 
-## License and Calibre obligations
+### Health and routes
 
-This project is released under the [MIT License](LICENSE). The runtime image
-also distributes Debian's Calibre package, which is licensed under the GNU
-GPLv3. When distributing the image, retain the applicable license notices and
-provide the corresponding Calibre source or written offer as required by the
-GPLv3. See the [Calibre project](https://github.com/kovidgoyal/calibre) and
-Debian package notices for authoritative terms. Grimmory and ebook contents
-remain separate works with their own licenses and usage rights.
+```sh
+curl --fail http://127.0.0.1:8080/health
+```
+
+`GET /health` requires no authentication. The other routes require
+`Authorization: Bearer <API_KEY>`:
+
+| Method | Route | Query |
+| --- | --- | --- |
+| `GET` | `/formats` | — |
+| `POST` | `/sync/{libraryId}/{bookId}` | optional `dryRun=true\|false`, `force=true\|false` |
+
+### Retrieve the generated key
+
+When `API_KEY` is unset or blank, retrieve the generated key with:
+
+```sh
+docker compose exec -T grimmory-format-service cat /data/api-key
+```
+
+### Manual sync
+
+```sh
+curl --fail-with-body -X POST \
+  'http://127.0.0.1:8080/sync/LIBRARY_ID/BOOK_ID?dryRun=false&force=false' \
+  -H "Authorization: Bearer ${API_KEY}"
+```
+
+### Polling
+
+Polling starts an immediate scan and then scans at `POLL_INTERVAL`. It performs
+real Grimmory writes; use the manual route with `dryRun=true` to inspect a
+sync without writes.
+
+> Safety: preserve `/data`; the generated key is a secret; polling writes to
+> Grimmory; existing derivatives are not overwritten. Verify Grimmory OpenAPI
+> before enabling writes.
+
+## Configuration
+
+| Variable | Default | Constraints |
+| --- | --- | --- |
+| `API_KEY` | generated | Non-empty value overrides the generated key; otherwise load or create `/data/api-key`. |
+| `PORT` | `8080` | Decimal integer `0`–`65535`. |
+| `ADDR` | `:${PORT}` | HTTP listen address. |
+| `DATA_DIR` | `/data` | Writable state and key directory. |
+| `CALIBRE_BINARY` | `ebook-convert` | Executable name or path. |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `warning`, or `error`. |
+| `GRIMMORY_BASE_URL` | required | Absolute `http` or `https` URL without userinfo, query, or fragment. |
+| `GRIMMORY_USERNAME` | required | Non-empty Grimmory account name. |
+| `GRIMMORY_PASSWORD` | required | Non-empty Grimmory credential. |
+| `LIBRARY_IDS` | required | Comma-separated unsigned decimal library IDs. |
+| `OUTPUT_FORMATS` | `mobi,azw3` | Non-empty comma/whitespace-separated format tokens; normalized lowercase; 1–32 characters. |
+| `SUPPORTED_INPUT_FORMATS` | `epub,azw3,mobi` | Non-empty comma/whitespace-separated format tokens; normalized lowercase; 1–32 characters. |
+| `IGNORE_PROCESSING_TAG` | disabled | Exact tag to skip when non-blank. |
+| `FAILED_PROCESSING_TAG` | disabled | Exact tag for exhausted polling failures when non-blank. |
+| `MAX_CONCURRENT_BOOKS` | `1` | Integer `1`–`16`. |
+| `MAX_FILE_BYTES` | `100 MiB` | Integer `1` byte–`2 GiB`. |
+| `MAX_RESPONSE_BYTES` | `8 MiB` | Integer `1` byte–`64 MiB`. |
+| `HTTP_TIMEOUT` | `30s` | Go duration `1ms`–`10m`. |
+| `CONVERSION_TIMEOUT` | `10m` | Go duration `1ms`–`2h`. |
+| `DATABASE_BUSY_TIMEOUT` | `5s` | Go duration `0`–`1m`. |
+| `POLL_INTERVAL` | `5m` | Go duration `1ms`–`24h`. |
+| `POLL_MAX_ATTEMPTS` | `5` | Integer `1`–`1000`. |
+| `POLL_RETRY_BASE` | `30s` | Go duration `1ms`–`24h`; not greater than `POLL_RETRY_MAX`. |
+| `POLL_RETRY_MAX` | `15m` | Go duration `1ms`–`168h`; not less than `POLL_RETRY_BASE`. |
