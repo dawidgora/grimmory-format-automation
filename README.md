@@ -15,6 +15,16 @@ flowchart LR
     Service --> State[(SQLite)]
 ```
 
+## How it works
+
+- The service reads the Grimmory library `formatPriority`. It uses the first entry as the main format.
+- It creates only missing formats that `OUTPUT_FORMATS` requests and the library policy allows.
+- If the main file is missing, the service uses the first supported fallback in the remaining priority order.
+- It converts that file into the missing main format and verifies the upload.
+- If no supported fallback exists, the sync stops with `no_source`.
+- `OUTPUT_FORMATS` lists derived formats, not the main format. The service removes any entry that matches the selected main format.
+- The default `mobi,azw3` list therefore excludes the selected main format when it appears. Grimmory's library policy selects the main format, and `OUTPUT_FORMATS` requests additional derivatives.
+
 ## Installation
 
 Docker Compose polling is the default.
