@@ -29,7 +29,7 @@ LABEL org.opencontainers.image.title="Grimmory Format Automation" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.source="https://github.com/dawidgora/grimmory-format-automation" \
-      org.opencontainers.image.licenses="MIT AND GPL-3.0-only"
+      org.opencontainers.image.licenses="GPL-3.0-only"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends calibre ca-certificates curl \
