@@ -35,7 +35,7 @@ Docker Compose polling is the default.
 ```yaml
 services:
   grimmory-format-service:
-    build: ./converter
+    image: ghcr.io/dawidgora/grimmory-format-automation:latest
     # Remove `command: ["--poll"]` for manual-only operation.
     command: ["--poll"]
     ports:
@@ -100,10 +100,6 @@ curl --fail-with-body -X POST \
 
 The Compose example enables polling. Polling writes to Grimmory. Use
 `dryRun=true` only for manual syncs.
-
-> Safety: Preserve `/data`. Treat the generated key as a secret. Polling writes
-> to Grimmory. The service does not overwrite existing derivatives. Verify
-> Grimmory OpenAPI before enabling writes.
 
 ## Configuration
 
