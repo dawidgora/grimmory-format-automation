@@ -36,6 +36,7 @@ Docker Compose polling is the default.
 services:
   grimmory-format-service:
     image: ghcr.io/dawidgora/grimmory-format-automation:latest
+    restart: unless-stopped
     # Remove `command: ["--poll"]` for manual-only operation.
     command: ["--poll"]
     ports:
@@ -59,7 +60,7 @@ volumes:
 - Start the service:
 
   ```sh
-  docker compose up -d --build
+  docker compose up -d
   ```
 
 ## Usage
