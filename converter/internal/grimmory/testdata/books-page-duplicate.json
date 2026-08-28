@@ -1,0 +1,25 @@
+{
+  "content": [
+    {
+      "id": "10",
+      "primaryFile": {
+        "id": "1001",
+        "fileName": "first.epub",
+        "bookType": "EPUB",
+        "fileSizeKb": 1200
+      },
+      "alternativeFormats": [],
+      "supplementaryFiles": []
+    }
+  ],
+  "links": {
+    "self": "/api/v1/books/page?page=1&size=100",
+    "next": null
+  },
+  "page": {
+    "size": 100,
+    "number": 1,
+    "totalElements": 3,
+    "totalPages": 2
+  }
+}

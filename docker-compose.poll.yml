@@ -1,0 +1,49 @@
+services:
+  grimmory-format-service:
+    build:
+      context: ./converter
+      args:
+        VERSION: ${VERSION:-dev}
+        VCS_REF: ${VCS_REF:-local}
+    image: ${CONVERTER_IMAGE:-grimmory-format-automation:local}
+    command: ["--poll"]
+    restart: unless-stopped
+    stop_grace_period: 31m
+    init: true
+    environment:
+      # Leave API_KEY unset or blank to generate /data/api-key on first start.
+      - API_KEY
+      - CONVERTER_LOG_LEVEL
+      - LOG_LEVEL
+      # These values are required by the sync implementation. Keep them
+      # in an ignored environment or inject them from a secret manager.
+      - GRIMMORY_BASE_URL
+      - GRIMMORY_USERNAME
+      - GRIMMORY_PASSWORD
+      - LIBRARY_IDS
+      - OUTPUT_FORMATS
+      - SUPPORTED_INPUT_FORMATS
+      - IGNORE_PROCESSING_TAG
+      - FAILED_PROCESSING_TAG
+      - MAX_CONCURRENT_BOOKS
+      - MAX_FILE_BYTES
+      - MAX_RESPONSE_BYTES
+      - HTTP_TIMEOUT
+      - CONVERSION_TIMEOUT
+      - DATABASE_BUSY_TIMEOUT
+      - POLL_INTERVAL
+      - POLL_MAX_ATTEMPTS
+      - POLL_RETRY_BASE
+      - POLL_RETRY_MAX
+      - DATA_DIR=/data
+      - PORT=8080
+    ports:
+      - "${PORT:-8080}:8080"
+    volumes:
+      # /data contains the service key and reconciliation state only.
+      - converter_data:/data
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  converter_data:

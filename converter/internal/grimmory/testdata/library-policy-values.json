@@ -1,0 +1,6 @@
+{
+  "id": "library-1",
+  "name": "Main Library",
+  "formatPriority": [".EPUB", "MOBI"],
+  "allowedFormats": ["AZW3", ".MOBI"]
+}

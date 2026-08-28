@@ -1,0 +1,18 @@
+# Keep build contexts free of repository metadata, secrets, and local state.
+.git
+.gitignore
+.github
+.env
+.env.*
+data
+converter/data
+# Local ebook content is never part of an image build context.
+books
+*.db
+*.db-shm
+*.db-wal
+*.log
+tmp
+dist
+README.md
+LICENSE

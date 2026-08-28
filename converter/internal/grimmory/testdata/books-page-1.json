@@ -1,0 +1,53 @@
+{
+  "content": [
+    {
+      "id": "30",
+      "metadata": {
+        "title": "Third Book",
+        "authors": [
+          {
+            "name": "Third Author"
+          }
+        ],
+        "language": "fr",
+        "publisher": "Another Press",
+        "publishedDate": "2023-03-04",
+        "identifiers": [
+          {
+            "type": "ISBN",
+            "value": "9780000000003"
+          }
+        ],
+        "series": {
+          "name": "Another Series",
+          "sequence": "2"
+        },
+        "tags": [
+          {
+            "name": "fiction"
+          }
+        ],
+        "description": "A third book."
+      },
+      "primaryFile": {
+        "id": "3001",
+        "fileName": "third.pdf",
+        "bookType": "PDF",
+        "extension": ".pdf",
+        "fileSizeKb": 700
+      },
+      "alternativeFormats": [],
+      "supplementaryFiles": []
+    }
+  ],
+  "links": {
+    "self": "/api/v1/books/page?page=1&size=100",
+    "next": null
+  },
+  "page": {
+    "size": 100,
+    "number": 1,
+    "totalElements": 3,
+    "totalPages": 2
+  }
+}

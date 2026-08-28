@@ -1,0 +1,62 @@
+{
+  "id": 1,
+  "metadata": {
+    "title": "A Book",
+    "authors": [
+      {
+        "name": "Author"
+      }
+    ],
+    "language": "en",
+    "publisher": "Press",
+    "publicationDate": "2025-01-02",
+    "identifiers": [
+      {
+        "type": "ISBN",
+        "value": "9780000000001"
+      }
+    ],
+    "series": {
+      "name": "Series",
+      "sequence": 1
+    },
+    "tags": [
+      "existing"
+    ],
+    "description": "A complete description.",
+    "comments": "Complete comments."
+  },
+  "primaryFile": {
+    "id": 101,
+    "fileName": "A Book.epub",
+    "bookType": "EPUB",
+    "extension": ".EPUB",
+    "fileSizeKb": 1200,
+    "updatedAt": "2025-01-02T03:04:05Z"
+  },
+  "alternativeFormats": [
+    {
+      "id": 102,
+      "fileName": "A Book.mobi",
+      "bookType": "MOBI",
+      "extension": ".mobi",
+      "fileSizeKb": 900
+    },
+    {
+      "id": 103,
+      "fileName": "A Book.azw3",
+      "bookType": "AZW3",
+      "extension": "azw3",
+      "fileSizeKb": 950
+    }
+  ],
+  "supplementaryFiles": [
+    {
+      "id": 104,
+      "fileName": "cover.jpg",
+      "bookType": "IMAGE",
+      "extension": ".jpg",
+      "fileSizeKb": 80
+    }
+  ]
+}
