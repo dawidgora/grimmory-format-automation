@@ -64,13 +64,7 @@ type endpointStore struct{}
 func (endpointStore) Get(context.Context, string, string) (state.BookState, map[string]state.DerivedState, error) {
 	return state.BookState{}, map[string]state.DerivedState{}, nil
 }
-func (endpointStore) GetDerivedUploadIntents(context.Context, string, string) (map[string]state.DerivedUploadIntent, error) {
-	return map[string]state.DerivedUploadIntent{}, nil
-}
-func (endpointStore) SetBook(context.Context, state.BookState) error { return nil }
-func (endpointStore) SetDerivedUploadIntent(context.Context, state.DerivedUploadIntent) error {
-	return nil
-}
+func (endpointStore) SetBook(context.Context, state.BookState) error       { return nil }
 func (endpointStore) SetDerived(context.Context, state.DerivedState) error { return nil }
 
 type endpointConverter struct{}
@@ -204,7 +198,7 @@ func TestFormatsAndSyncDryRunAndRouteRemoval(t *testing.T) {
 	if sync.Code != http.StatusOK || !strings.Contains(sync.Body.String(), `"status":"dry_run"`) || !strings.Contains(sync.Body.String(), `"force":true`) {
 		t.Fatalf("dry run response = %d %s", sync.Code, sync.Body.String())
 	}
-	for _, path := range []string{"/convert", "/convert/", "/library/scan", "/grimmory/books"} {
+	for _, path := range []string{"/convert", "/convert/", "/library/scan", "/grimmory/books", "/adopt/1/book-1/mobi"} {
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		response := httptest.NewRecorder()
 		server.ServeHTTP(response, request)
@@ -216,7 +210,7 @@ func TestFormatsAndSyncDryRunAndRouteRemoval(t *testing.T) {
 
 func TestLiveBlockedRebuildReturnsConflict(t *testing.T) {
 	server := blockedEndpointServer(t)
-	request := httptest.NewRequest(http.MethodPost, "/sync/1/book-1?force=true", nil)
+	request := httptest.NewRequest(http.MethodPost, "/sync/1/book-1", nil)
 	request.Header.Set("Authorization", "Bearer secret")
 	response := httptest.NewRecorder()
 	server.ServeHTTP(response, request)

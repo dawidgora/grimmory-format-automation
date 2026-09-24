@@ -35,7 +35,14 @@ type Store interface {
 	ListDuePollStates(context.Context, string, time.Time, int) ([]state.PollState, error)
 	MarkPollSuccess(context.Context, string, string, string, time.Time) error
 	RecordPollFailure(context.Context, string, string, string, string, time.Time, int, time.Time) (state.PollState, error)
-	RequeuePollObservation(context.Context, string, string, string, string, time.Time, time.Time) error
+}
+
+type PendingReplacementStore interface {
+	HasPendingReplacementTag(context.Context, string, string) (bool, error)
+}
+
+type PendingPollStore interface {
+	MarkPollPending(context.Context, string, string, string, time.Time) (state.PollState, error)
 }
 
 type Options struct {
@@ -230,25 +237,50 @@ func (s *Scheduler) Scan(ctx context.Context) (scanErr error) {
 				appendError(fmt.Errorf("library %s book %s failed membership validation", libraryID, bookID))
 				continue
 			}
-			if hasTag(book, s.ignoreTag) {
+			pendingCleanup := false
+			if pendingStore, ok := s.store.(PendingReplacementStore); ok {
+				pendingCleanup, err = pendingStore.HasPendingReplacementTag(ctx, libraryID, bookID)
+				if err != nil {
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					s.logBookFailure(libraryID, bookID, "poll pending cleanup state failed", err)
+					continue
+				}
+			}
+			if hasTag(book, s.ignoreTag) && !pendingCleanup {
 				summary.bookIgnored()
 				if err := s.clearFailureTagForIgnored(ctx, libraryID, bookID, book); err != nil {
 					if ctx.Err() != nil {
 						return ctx.Err()
 					}
 					s.logBookFailure(libraryID, bookID, "poll ignored book tag cleanup failed", err)
-					appendError(fmt.Errorf("clear failure tag for ignored book %s/%s: %w", libraryID, bookID, err))
 				}
 				continue
 			}
 			fingerprint := grimmory.ObservationFingerprintIgnoringTags(book, s.ignoreTag, s.failedTag)
-			if _, err := s.store.UpsertPollObservation(ctx, libraryID, bookID, fingerprint, s.now()); err != nil {
+			seenAt := s.now()
+			if _, err := s.store.UpsertPollObservation(ctx, libraryID, bookID, fingerprint, seenAt); err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
 				s.logBookFailure(libraryID, bookID, "poll observation failed", err)
 				appendError(fmt.Errorf("upsert poll observation %s/%s: %w", libraryID, bookID, err))
 				continue
+			}
+			if pendingCleanup {
+				pendingStore, ok := s.store.(PendingPollStore)
+				if !ok {
+					s.logBookFailure(libraryID, bookID, "poll durable replacement state unsupported", errors.New("poll pending state mutation is unsupported"))
+					continue
+				}
+				if _, err := pendingStore.MarkPollPending(ctx, libraryID, bookID, fingerprint, seenAt); err != nil {
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					s.logBookFailure(libraryID, bookID, "poll durable replacement state failed", err)
+					continue
+				}
 			}
 			ready[pollKey(libraryID, bookID)] = struct{}{}
 		}
@@ -451,13 +483,21 @@ func (s *Scheduler) processLocked(ctx context.Context, pollState state.PollState
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, syncErr := s.reconciler.Sync(ctx, pollState.LibraryID, pollState.BookID, reconcile.SyncOptions{})
+	syncResult, syncErr := s.reconciler.Sync(ctx, pollState.LibraryID, pollState.BookID, reconcile.SyncOptions{})
 	if syncErr != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		s.recordFailure(ctx, pollState, syncErr)
-		return syncErr
+		if syncResult.Error != "failure_tag_failed" || !errors.Is(syncErr, reconcile.ErrFailureTagMutation) {
+			s.recordFailure(ctx, pollState, syncErr)
+			return syncErr
+		}
+		s.logBookFailure(pollState.LibraryID, pollState.BookID, "poll reconciliation completed but failure tag cleanup failed", syncErr)
+	}
+	if syncErr == nil && syncResult.Status == "ignored" {
+		// Ignore is not an applied observation. Leave the pending/retry state
+		// untouched so removing the ignore tag can resume this work.
+		return nil
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -504,10 +544,6 @@ func (s *Scheduler) recordFailure(ctx context.Context, pollState state.PollState
 	if ctx.Err() != nil {
 		return
 	}
-	if errors.Is(cause, reconcile.ErrFailureTagMutation) {
-		s.recordTagMutationFailure(ctx, pollState, cause)
-		return
-	}
 	transient := IsTransient(cause)
 	maxAttempts := 1
 	nextAttempt := time.Time{}
@@ -516,12 +552,6 @@ func (s *Scheduler) recordFailure(ctx context.Context, pollState state.PollState
 		nextAttempt = s.now().Add(s.backoff(pollState.AttemptCount))
 	}
 	retryExhausted := !transient || pollState.AttemptCount+1 >= maxAttempts
-	if retryExhausted && s.failedTag != "" {
-		if err := s.setFailureTag(ctx, pollState, true); err != nil {
-			s.recordTagMutationFailure(ctx, pollState, err)
-			return
-		}
-	}
 	code := failureCode(cause, transient)
 	_, err := s.store.RecordPollFailure(ctx, pollState.LibraryID, pollState.BookID, pollState.ObservationFingerprint, code, nextAttempt, maxAttempts, s.now())
 	if err != nil {
@@ -535,6 +565,11 @@ func (s *Scheduler) recordFailure(ctx context.Context, pollState state.PollState
 	} else {
 		s.logBookFailure(pollState.LibraryID, pollState.BookID, "poll retries exhausted", cause)
 	}
+	if retryExhausted && s.failedTag != "" {
+		if err := s.setFailureTag(ctx, pollState, true); err != nil {
+			s.logBookFailure(pollState.LibraryID, pollState.BookID, "poll failure tag mutation failed", err)
+		}
+	}
 }
 
 func (s *Scheduler) setFailureTag(ctx context.Context, pollState state.PollState, present bool) error {
@@ -545,23 +580,7 @@ func (s *Scheduler) setFailureTag(ctx context.Context, pollState state.PollState
 	return tagger.SetFailureTag(ctx, pollState.LibraryID, pollState.BookID, present)
 }
 
-func (s *Scheduler) recordTagMutationFailure(ctx context.Context, pollState state.PollState, cause error) {
-	if ctx.Err() != nil {
-		return
-	}
-	if err := s.store.RequeuePollObservation(ctx, pollState.LibraryID, pollState.BookID, pollState.ObservationFingerprint, "failure_tag_mutation", time.Time{}, s.now()); err != nil {
-		if ctx.Err() == nil {
-			s.logBookFailure(pollState.LibraryID, pollState.BookID, "poll failure tag state failed", err)
-		}
-		return
-	}
-	s.logBookFailure(pollState.LibraryID, pollState.BookID, "poll failure tag retry scheduled", cause)
-}
-
 func (s *Scheduler) failureWasRetried(pollState state.PollState, err error) bool {
-	if errors.Is(err, reconcile.ErrFailureTagMutation) {
-		return true
-	}
 	return IsTransient(err) && pollState.AttemptCount+1 < s.maxAttempts
 }
 
@@ -615,6 +634,9 @@ func IsTransient(err error) bool {
 		return httpError.Status == 408 || httpError.Status == 425 || httpError.Status == 429 || httpError.Status >= 500
 	}
 	if errors.Is(err, reconcile.ErrVerification) {
+		return true
+	}
+	if errors.Is(err, reconcile.ErrReplacementTagMutation) {
 		return true
 	}
 	return isSQLiteBusy(err)

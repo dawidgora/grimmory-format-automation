@@ -13,45 +13,49 @@ import (
 )
 
 const (
-	defaultMaxFileBytes       int64 = 100 << 20
-	defaultMaxResponseBytes   int64 = 8 << 20
-	defaultHTTPTimeout              = 30 * time.Second
-	defaultConversionTimeout        = 10 * time.Minute
-	defaultBusyTimeout              = 5 * time.Second
-	defaultPollInterval             = 5 * time.Minute
-	defaultPollMaxAttempts          = 5
-	defaultPollRetryBase            = 30 * time.Second
-	defaultPollRetryMax             = 15 * time.Minute
-	defaultMaxConcurrentBooks       = 1
-	maxFormatLength                 = 32
+	defaultMaxFileBytes             int64 = 100 << 20
+	defaultMaxResponseBytes         int64 = 8 << 20
+	defaultHTTPTimeout                    = 30 * time.Second
+	defaultConversionTimeout              = 10 * time.Minute
+	defaultBusyTimeout                    = 5 * time.Second
+	defaultPollInterval                   = 5 * time.Minute
+	defaultPollMaxAttempts                = 5
+	defaultPollRetryBase                  = 30 * time.Second
+	defaultPollRetryMax                   = 15 * time.Minute
+	defaultMaxConcurrentBooks             = 1
+	defaultExistingDerivativePolicy       = "preserve"
+	defaultDerivativeReplacementTag       = "derivative-replacement"
+	maxFormatLength                       = 32
 )
 
 var formatPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9+_-]{0,31}$`)
 
 // Config contains runtime settings for the standalone reconciliation service.
 type Config struct {
-	Addr                  string
-	DataDir               string
-	CalibreBinary         string
-	LogLevel              logging.Level
-	GrimmoryBaseURL       string
-	GrimmoryUsername      string
-	GrimmoryPassword      string
-	LibraryIDs            []string
-	OutputFormats         []string
-	SupportedInputFormats []string
-	IgnoreProcessingTag   string
-	FailedProcessingTag   string
-	MaxConcurrentBooks    int
-	MaxFileBytes          int64
-	MaxResponseBytes      int64
-	HTTPTimeout           time.Duration
-	ConversionTimeout     time.Duration
-	DatabaseBusyTimeout   time.Duration
-	PollInterval          time.Duration
-	PollMaxAttempts       int
-	PollRetryBase         time.Duration
-	PollRetryMax          time.Duration
+	Addr                     string
+	DataDir                  string
+	CalibreBinary            string
+	LogLevel                 logging.Level
+	GrimmoryBaseURL          string
+	GrimmoryUsername         string
+	GrimmoryPassword         string
+	LibraryIDs               []string
+	OutputFormats            []string
+	SupportedInputFormats    []string
+	IgnoreProcessingTag      string
+	FailedProcessingTag      string
+	ExistingDerivativePolicy string
+	DerivativeReplacementTag string
+	MaxConcurrentBooks       int
+	MaxFileBytes             int64
+	MaxResponseBytes         int64
+	HTTPTimeout              time.Duration
+	ConversionTimeout        time.Duration
+	DatabaseBusyTimeout      time.Duration
+	PollInterval             time.Duration
+	PollMaxAttempts          int
+	PollRetryBase            time.Duration
+	PollRetryMax             time.Duration
 }
 
 func Load() (Config, error) {
@@ -113,6 +117,20 @@ func Load() (Config, error) {
 	if ignoreTag != "" && ignoreTag == failedTag {
 		return Config{}, fmt.Errorf("IGNORE_PROCESSING_TAG and FAILED_PROCESSING_TAG must differ")
 	}
+	existingDerivativePolicy := strings.ToLower(strings.TrimSpace(os.Getenv("EXISTING_DERIVATIVE_POLICY")))
+	if existingDerivativePolicy == "" {
+		existingDerivativePolicy = defaultExistingDerivativePolicy
+	}
+	if existingDerivativePolicy != "preserve" && existingDerivativePolicy != "replace" {
+		return Config{}, fmt.Errorf("invalid EXISTING_DERIVATIVE_POLICY %q", existingDerivativePolicy)
+	}
+	derivativeReplacementTag := strings.TrimSpace(os.Getenv("DERIVATIVE_REPLACEMENT_TAG"))
+	if derivativeReplacementTag == "" {
+		derivativeReplacementTag = defaultDerivativeReplacementTag
+	}
+	if derivativeReplacementTag == ignoreTag || derivativeReplacementTag == failedTag {
+		return Config{}, fmt.Errorf("DERIVATIVE_REPLACEMENT_TAG must differ from processing tags")
+	}
 	maxConcurrentBooks, err := boundedInt("MAX_CONCURRENT_BOOKS", defaultMaxConcurrentBooks, 1, 16)
 	if err != nil {
 		return Config{}, err
@@ -159,28 +177,30 @@ func Load() (Config, error) {
 	}
 
 	return Config{
-		Addr:                  addr,
-		DataDir:               dataDir,
-		CalibreBinary:         calibre,
-		LogLevel:              logLevel,
-		GrimmoryBaseURL:       baseURL,
-		GrimmoryUsername:      username,
-		GrimmoryPassword:      password,
-		LibraryIDs:            append([]string(nil), libraryIDs...),
-		OutputFormats:         append([]string(nil), outputs...),
-		SupportedInputFormats: append([]string(nil), inputs...),
-		IgnoreProcessingTag:   ignoreTag,
-		FailedProcessingTag:   failedTag,
-		MaxConcurrentBooks:    maxConcurrentBooks,
-		MaxFileBytes:          maxFileBytes,
-		MaxResponseBytes:      maxResponseBytes,
-		HTTPTimeout:           httpTimeout,
-		ConversionTimeout:     conversionTimeout,
-		DatabaseBusyTimeout:   busyTimeout,
-		PollInterval:          pollInterval,
-		PollMaxAttempts:       pollMaxAttempts,
-		PollRetryBase:         pollRetryBase,
-		PollRetryMax:          pollRetryMax,
+		Addr:                     addr,
+		DataDir:                  dataDir,
+		CalibreBinary:            calibre,
+		LogLevel:                 logLevel,
+		GrimmoryBaseURL:          baseURL,
+		GrimmoryUsername:         username,
+		GrimmoryPassword:         password,
+		LibraryIDs:               append([]string(nil), libraryIDs...),
+		OutputFormats:            append([]string(nil), outputs...),
+		SupportedInputFormats:    append([]string(nil), inputs...),
+		IgnoreProcessingTag:      ignoreTag,
+		FailedProcessingTag:      failedTag,
+		ExistingDerivativePolicy: existingDerivativePolicy,
+		DerivativeReplacementTag: derivativeReplacementTag,
+		MaxConcurrentBooks:       maxConcurrentBooks,
+		MaxFileBytes:             maxFileBytes,
+		MaxResponseBytes:         maxResponseBytes,
+		HTTPTimeout:              httpTimeout,
+		ConversionTimeout:        conversionTimeout,
+		DatabaseBusyTimeout:      busyTimeout,
+		PollInterval:             pollInterval,
+		PollMaxAttempts:          pollMaxAttempts,
+		PollRetryBase:            pollRetryBase,
+		PollRetryMax:             pollRetryMax,
 	}, nil
 }
 

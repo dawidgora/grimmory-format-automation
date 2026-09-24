@@ -126,7 +126,7 @@ func (entry *syncLog) fields() []logging.Field {
 
 func safeResultCode(value string) string {
 	switch value {
-	case "invalid_library_id", "library_not_allowed", "library_policy_failed", "invalid_book_id", "service_not_initialized", "get_book_failed", "state_read_failed", "no_source", "workspace_failed", "download_main_failed", "canonical_hash_mismatch", "state_write_failed", "derivative_failed", reconcile.SafeReplacementUnavailableCode, "download_source_failed", "source_hash_mismatch", "main_conversion_failed", "main_hash_failed", "main_upload_failed", "verification_failed", "failure_tag_failed", "invalid_dry_run", "invalid_force", "service_unavailable", "unauthorized", "method_not_allowed", "request_failed":
+	case "invalid_library_id", "library_not_allowed", "library_policy_failed", "invalid_book_id", "service_not_initialized", "get_book_failed", "book_not_found", "state_read_failed", "no_source", "workspace_failed", "download_main_failed", "download_derivative_failed", "canonical_hash_mismatch", "state_write_failed", "derivative_failed", reconcile.SafeReplacementUnavailableCode, "download_source_failed", "source_hash_mismatch", "main_conversion_failed", "main_hash_failed", "main_upload_failed", "verification_failed", "failure_tag_failed", "replacement_tag_failed", "invalid_dry_run", "invalid_force", "service_unavailable", "unauthorized", "method_not_allowed", "request_failed", "timeout", "canceled", "ignored":
 		return value
 	default:
 		return ""
@@ -135,7 +135,7 @@ func safeResultCode(value string) string {
 
 func safeResultStatus(value string) string {
 	switch value {
-	case "failed", "partial", "completed", "dry_run":
+	case "failed", "partial", "completed", "dry_run", "ignored":
 		return value
 	default:
 		return "unknown"

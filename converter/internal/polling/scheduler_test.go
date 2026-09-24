@@ -101,6 +101,7 @@ type fakeReconciler struct {
 	mu        sync.Mutex
 	calls     []string
 	err       error
+	result    reconcile.Result
 	started   chan struct{}
 	finished  chan struct{}
 	remote    *fakeRemote
@@ -123,9 +124,9 @@ func (r *fakeReconciler) Sync(ctx context.Context, libraryID, bookID string, _ r
 		}
 	}
 	if err := r.errByBook[bookID]; err != nil {
-		return reconcile.Result{}, err
+		return r.result, err
 	}
-	return reconcile.Result{}, r.err
+	return r.result, r.err
 }
 
 func (r *fakeReconciler) SetFailureTag(ctx context.Context, libraryID, bookID string, present bool) error {
@@ -140,9 +141,28 @@ func (r *fakeReconciler) SetFailureTag(ctx context.Context, libraryID, bookID st
 }
 
 type memoryStore struct {
-	mu       sync.Mutex
-	states   map[string]state.PollState
-	failures int
+	mu                 sync.Mutex
+	states             map[string]state.PollState
+	pendingReplacement map[string]bool
+	failures           int
+}
+
+func (s *memoryStore) HasPendingReplacementTag(_ context.Context, _, bookID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pendingReplacement[bookID], nil
+}
+
+func (s *memoryStore) MarkPollPending(_ context.Context, _, bookID, fingerprint string, updatedAt time.Time) (state.PollState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, exists := s.states[bookID]
+	if !exists || value.ObservationFingerprint != fingerprint {
+		return state.PollState{}, errors.New("observation changed")
+	}
+	value.Status, value.NextAttemptAt, value.ErrorCode, value.UpdatedAt = state.PollStatusPending, time.Time{}, "", updatedAt
+	s.states[bookID] = value
+	return value, nil
 }
 
 func (s *memoryStore) UpsertPollObservation(_ context.Context, libraryID, bookID, fingerprint string, seenAt time.Time) (state.PollState, error) {
@@ -210,18 +230,6 @@ func (s *memoryStore) RecordPollFailure(_ context.Context, _, bookID, fingerprin
 	}
 	s.states[bookID] = value
 	return value, nil
-}
-
-func (s *memoryStore) RequeuePollObservation(_ context.Context, _, bookID, fingerprint, code string, next, updatedAt time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	value, exists := s.states[bookID]
-	if !exists || value.ObservationFingerprint != fingerprint {
-		return errors.New("observation changed")
-	}
-	value.Status, value.NextAttemptAt, value.ErrorCode, value.UpdatedAt = state.PollStatusRetry, next, code, updatedAt
-	s.states[bookID] = value
-	return nil
 }
 
 func testBook() grimmory.Book {
@@ -403,6 +411,106 @@ func TestSchedulerIgnoredBookClearsFailureTagWithoutProcessing(t *testing.T) {
 	}
 }
 
+func TestSchedulerProcessesDestructiveReplacementPhaseBeforeIgnoreTag(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	book := testBook()
+	book.Metadata.Tags = []string{"ignore"}
+	remote := &fakeRemote{books: []grimmory.Book{book}, detail: []grimmory.Book{book, book}}
+	store := &memoryStore{pendingReplacement: map[string]bool{book.ID: true}}
+	reconciler := &fakeReconciler{}
+	scheduler := newTestScheduler(t, remote, store, reconciler, &now)
+	scheduler.ignoreTag = "ignore"
+	fingerprint := grimmory.ObservationFingerprintIgnoringTags(book, scheduler.ignoreTag, scheduler.failedTag)
+	if _, err := store.UpsertPollObservation(context.Background(), "1", book.ID, fingerprint, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkPollSuccess(context.Background(), "1", book.ID, fingerprint, now); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := scheduler.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(reconciler.calls) != 1 || reconciler.calls[0] != "1/book" {
+		t.Fatalf("destructive replacement phase was ignored: calls=%v", reconciler.calls)
+	}
+	store.mu.Lock()
+	store.pendingReplacement[book.ID] = false
+	store.mu.Unlock()
+	remote.mu.Lock()
+	remote.detail = []grimmory.Book{book}
+	remote.mu.Unlock()
+	if err := scheduler.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(reconciler.calls) != 1 {
+		t.Fatalf("cleared replacement phase repeated unchanged observation: calls=%v", reconciler.calls)
+	}
+}
+
+func TestSchedulerKeepsIgnoredRecoveryPendingUntilTagRemoval(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	book := testBook()
+	book.Metadata.Tags = []string{"ignore"}
+	remote := &fakeRemote{books: []grimmory.Book{book}, detail: []grimmory.Book{book}}
+	store := &memoryStore{pendingReplacement: map[string]bool{book.ID: true}}
+	reconciler := &fakeReconciler{result: reconcile.Result{Status: "ignored"}}
+	scheduler := newTestScheduler(t, remote, store, reconciler, &now)
+	scheduler.ignoreTag = "ignore"
+	fingerprint := grimmory.ObservationFingerprintIgnoringTags(book, scheduler.ignoreTag, scheduler.failedTag)
+	if _, err := store.UpsertPollObservation(context.Background(), "1", book.ID, fingerprint, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkPollSuccess(context.Background(), "1", book.ID, fingerprint, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	firstState := store.states[book.ID]
+	store.mu.Unlock()
+	if firstState.Status != state.PollStatusPending || len(reconciler.calls) != 1 {
+		t.Fatalf("ignored recovery was marked applied: state=%+v calls=%v", firstState, reconciler.calls)
+	}
+
+	remote.mu.Lock()
+	remote.books[0].Metadata.Tags = nil
+	remote.detail = []grimmory.Book{remote.books[0], remote.books[0]}
+	remote.mu.Unlock()
+	store.mu.Lock()
+	store.pendingReplacement[book.ID] = false
+	store.mu.Unlock()
+	reconciler.result = reconcile.Result{Status: "completed"}
+	if err := scheduler.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	finalState := store.states[book.ID]
+	store.mu.Unlock()
+	if finalState.Status != state.PollStatusCurrent || len(reconciler.calls) != 2 {
+		t.Fatalf("ignored recovery did not resume after tag removal: state=%+v calls=%v", finalState, reconciler.calls)
+	}
+}
+
+func TestSchedulerIgnoredBookTagCleanupFailureDoesNotFailScan(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	book := testBook()
+	book.Metadata.Tags = []string{"ignore", "failed"}
+	remote := &fakeRemote{books: []grimmory.Book{book}, detail: []grimmory.Book{book}, tagError: errors.New("tag endpoint locked")}
+	store := &memoryStore{}
+	reconciler := &fakeReconciler{}
+	scheduler := newTestScheduler(t, remote, store, reconciler, &now)
+	scheduler.ignoreTag, scheduler.failedTag = "ignore", "failed"
+
+	if err := scheduler.Scan(context.Background()); err != nil {
+		t.Fatalf("ignored tag cleanup failure failed scan: %v", err)
+	}
+	if len(reconciler.calls) != 0 {
+		t.Fatalf("ignored book was reconciled: %v", reconciler.calls)
+	}
+}
+
 func TestSchedulerIgnoredBookWithIdenticalTagsIsNoOp(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	book := testBook()
@@ -504,6 +612,34 @@ func TestSchedulerRetriesTransientThenExhaustsRetries(t *testing.T) {
 	}
 }
 
+func TestSchedulerRetriesReplacementTagCleanupFailure(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	book := testBook()
+	remote := &fakeRemote{books: []grimmory.Book{book}, detail: []grimmory.Book{book, book}}
+	store := &memoryStore{}
+	reconciler := &fakeReconciler{err: reconcile.ErrReplacementTagMutation}
+	scheduler := newTestScheduler(t, remote, store, reconciler, &now)
+	if err := scheduler.Scan(context.Background()); err == nil {
+		t.Fatal("expected replacement-tag cleanup failure")
+	}
+	store.mu.Lock()
+	first := store.states[book.ID]
+	store.mu.Unlock()
+	if first.Status != state.PollStatusRetry || first.AttemptCount != 1 {
+		t.Fatalf("replacement cleanup was not scheduled for retry: %+v", first)
+	}
+	now = now.Add(time.Second)
+	if err := scheduler.Scan(context.Background()); err == nil {
+		t.Fatal("expected replacement-tag cleanup retry failure")
+	}
+	store.mu.Lock()
+	second := store.states[book.ID]
+	store.mu.Unlock()
+	if second.Status != state.PollStatusFailed || second.AttemptCount != 2 || len(reconciler.calls) != 2 {
+		t.Fatalf("replacement cleanup retry state=%+v calls=%v", second, reconciler.calls)
+	}
+}
+
 func TestSchedulerLeavesPostUploadObservationPending(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	before, after := testBook(), testBook()
@@ -549,6 +685,37 @@ func TestSchedulerMarksOnlyOriginalObservationSuccessfulAfterConcurrentChange(t 
 	store.mu.Unlock()
 	if value.Status != state.PollStatusPending || value.ObservationFingerprint != postFingerprint || value.AppliedFingerprint != originalFingerprint {
 		t.Fatalf("concurrent observation state = %+v", value)
+	}
+}
+
+func TestSchedulerTreatsSuccessfulSyncWithFailureTagCleanupErrorAsCurrent(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	book := testBook()
+	remote := &fakeRemote{books: []grimmory.Book{book}, detail: []grimmory.Book{book, book}}
+	store := &memoryStore{}
+	reconciler := &fakeReconciler{
+		err:    reconcile.ErrFailureTagMutation,
+		result: reconcile.Result{Status: "partial", Error: "failure_tag_failed"},
+	}
+	scheduler := newTestScheduler(t, remote, store, reconciler, &now)
+	scheduler.failedTag = "failed"
+
+	if err := scheduler.Scan(context.Background()); err != nil {
+		t.Fatalf("successful sync with tag cleanup failure failed scan: %v", err)
+	}
+	store.mu.Lock()
+	got := store.states[book.ID]
+	failures := store.failures
+	store.mu.Unlock()
+	if got.Status != state.PollStatusCurrent || got.AttemptCount != 0 || failures != 0 {
+		t.Fatalf("successful sync with tag cleanup failure state=%+v failures=%d", got, failures)
+	}
+	due, err := store.ListDuePollStates(context.Background(), "1", now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 || len(reconciler.calls) != 1 {
+		t.Fatalf("successful sync was retried: due=%+v calls=%v", due, reconciler.calls)
 	}
 }
 
@@ -603,10 +770,10 @@ func TestSchedulerFailureTagsDoNotChangeRetryObservation(t *testing.T) {
 	}
 }
 
-func TestSchedulerRequeuesWhenFailureTagMutationFails(t *testing.T) {
+func TestSchedulerRecordsTerminalFailureBeforeFailedTagMutation(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	book := testBook()
-	remote := &fakeRemote{books: []grimmory.Book{book}, detail: []grimmory.Book{book}}
+	remote := &fakeRemote{books: []grimmory.Book{book}, detail: []grimmory.Book{book}, tagError: errors.New("tag endpoint locked")}
 	store := &memoryStore{}
 	reconciler := &fakeReconciler{err: errors.New("permanent conversion failure")}
 	scheduler := newTestScheduler(t, remote, store, reconciler, &now)
@@ -616,25 +783,22 @@ func TestSchedulerRequeuesWhenFailureTagMutationFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := scheduler.process(context.Background(), stateValue); err == nil {
-		t.Fatal("expected conversion failure with tag mutation failure")
+	originalFailure := reconciler.err
+	if err := scheduler.process(context.Background(), stateValue); !errors.Is(err, originalFailure) {
+		t.Fatalf("processing error = %v, want original failure", err)
 	}
-	remote.mu.Lock()
-	remote.added = nil
-	remote.mu.Unlock()
-	// A tag mutation error must requeue the same observation without consuming
-	// another conversion attempt.
-	remote.tagError = errors.New("tag endpoint unavailable")
-	if err := scheduler.process(context.Background(), stateValue); err == nil {
-		t.Fatal("expected conversion failure after tag mutation failure")
-	}
-	remote.mu.Lock()
-	added := append([]string(nil), remote.added...)
-	remote.mu.Unlock()
 	store.mu.Lock()
 	got := store.states[book.ID]
+	failures := store.failures
 	store.mu.Unlock()
-	if len(added) != 0 || got.Status != state.PollStatusRetry || got.AttemptCount != 1 || got.NextAttemptAt.After(now) {
-		t.Fatalf("tag mutation retry state=%+v added=%v", got, added)
+	if got.Status != state.PollStatusFailed || got.AttemptCount != 1 || got.ErrorCode != "permanent_internal" || failures != 1 {
+		t.Fatalf("terminal state after tag mutation failure=%+v failures=%d", got, failures)
+	}
+	due, err := store.ListDuePollStates(context.Background(), "1", now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("terminal failure was requeued after tag mutation failure: %+v", due)
 	}
 }
