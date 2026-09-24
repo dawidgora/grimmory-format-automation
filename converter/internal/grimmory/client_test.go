@@ -373,6 +373,194 @@ func TestClientBookTagMutationUsesTagPatchAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestClientBookTagMutationUnlocksAndRelocksLockedMetadata(t *testing.T) {
+	currentTags := []string{"keep"}
+	tagsLocked := true
+	var puts []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/login":
+			writeJSON(w, map[string]string{"accessToken": "token"})
+		case "/api/v1/books/book-1":
+			writeJSON(w, map[string]any{
+				"id": "book-1", "libraryId": "library-1",
+				"metadata": map[string]any{"title": "Book", "tags": currentTags, "tagsLocked": tagsLocked},
+				"files":    []any{},
+			})
+		case "/api/v1/libraries/library-1/book/book-1":
+			writeJSON(w, map[string]any{"id": "book-1", "libraryId": "library-1", "files": []any{}})
+		case "/api/v1/books/book-1/metadata":
+			if r.Method != http.MethodPut || r.URL.Query().Get("replaceMode") != "REPLACE_WHEN_PROVIDED" || len(r.URL.Query()) != 1 {
+				t.Errorf("metadata update request = %s %q", r.Method, r.URL.RawQuery)
+			}
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("metadata body: %v", err)
+				return
+			}
+			metadata, metadataOK := payload["metadata"].(map[string]any)
+			clearFlags, clearFlagsOK := payload["clearFlags"].(map[string]any)
+			if len(payload) != 2 || !metadataOK || !clearFlagsOK {
+				t.Errorf("metadata lock body shape = %#v", payload)
+			}
+			if value, ok := metadata["tagsLocked"].(bool); ok {
+				if len(metadata) != 1 || len(clearFlags) != 0 {
+					t.Errorf("lock body metadata = %#v", metadata)
+				}
+				tagsLocked = value
+				if value {
+					puts = append(puts, "relock")
+				} else {
+					puts = append(puts, "unlock")
+				}
+				writeJSON(w, map[string]bool{"ok": true})
+				return
+			}
+			values, valuesOK := metadata["tags"].([]any)
+			if len(metadata) != 1 || !valuesOK || len(clearFlags) != 1 || clearFlags["tags"] != false {
+				t.Errorf("tag body metadata = %#v", metadata)
+			} else {
+				currentTags = make([]string, 0, len(values))
+				for _, value := range values {
+					currentTags = append(currentTags, value.(string))
+				}
+			}
+			puts = append(puts, "tags")
+			writeJSON(w, map[string]bool{"ok": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "user", "password", server.Client(), 1<<20, 1<<20, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.AddBookTagScoped(context.Background(), BookReference{LibraryID: "library-1", BookID: "book-1"}, "new"); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(puts, []string{"unlock", "tags", "relock"}) {
+		t.Fatalf("metadata PUT order = %v", puts)
+	}
+	if !reflect.DeepEqual(currentTags, []string{"keep", "new"}) || !tagsLocked {
+		t.Fatalf("final metadata tags=%v tagsLocked=%v", currentTags, tagsLocked)
+	}
+}
+
+func TestClientBookTagMutationRelocksAfterTagUpdateFailure(t *testing.T) {
+	tagsLocked := true
+	var puts []string
+	var cancel context.CancelFunc
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/login":
+			writeJSON(w, map[string]string{"accessToken": "token"})
+		case "/api/v1/books/book-1":
+			writeJSON(w, map[string]any{
+				"id": "book-1", "libraryId": "library-1",
+				"metadata": map[string]any{"title": "Book", "tags": []string{"keep"}, "tagsLocked": tagsLocked},
+				"files":    []any{},
+			})
+		case "/api/v1/libraries/library-1/book/book-1":
+			writeJSON(w, map[string]any{"id": "book-1", "libraryId": "library-1", "files": []any{}})
+		case "/api/v1/books/book-1/metadata":
+			if r.Method != http.MethodPut {
+				t.Errorf("metadata update method = %s", r.Method)
+			}
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("metadata body: %v", err)
+				return
+			}
+			metadata, _ := payload["metadata"].(map[string]any)
+			if value, ok := metadata["tagsLocked"].(bool); ok {
+				tagsLocked = value
+				if value {
+					puts = append(puts, "relock")
+				} else {
+					puts = append(puts, "unlock")
+				}
+				writeJSON(w, map[string]bool{"ok": true})
+				return
+			}
+			puts = append(puts, "tags")
+			http.Error(w, "sensitive server detail", http.StatusInternalServerError)
+			cancel()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "user", "password", server.Client(), 1<<20, 1<<20, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancelContext := context.WithCancel(context.Background())
+	cancel = cancelContext
+	err = client.AddBookTagScoped(ctx, BookReference{LibraryID: "library-1", BookID: "book-1"}, "new")
+	if err == nil || strings.Contains(err.Error(), "sensitive server detail") {
+		t.Fatalf("tag update failure = %v", err)
+	}
+	if !reflect.DeepEqual(puts, []string{"unlock", "tags", "relock"}) || !tagsLocked {
+		t.Fatalf("failure cleanup puts=%v tagsLocked=%v", puts, tagsLocked)
+	}
+}
+
+func TestClientBookTagMutationRelocksAfterAmbiguousUnlockFailure(t *testing.T) {
+	tagsLocked := true
+	var puts []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/login":
+			writeJSON(w, map[string]string{"accessToken": "token"})
+		case "/api/v1/books/book-1":
+			writeJSON(w, map[string]any{
+				"id": "book-1", "libraryId": "library-1",
+				"metadata": map[string]any{"title": "Book", "tags": []string{"keep"}, "tagsLocked": tagsLocked},
+				"files":    []any{},
+			})
+		case "/api/v1/libraries/library-1/book/book-1":
+			writeJSON(w, map[string]any{"id": "book-1", "libraryId": "library-1", "files": []any{}})
+		case "/api/v1/books/book-1/metadata":
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("metadata body: %v", err)
+				return
+			}
+			metadata, _ := payload["metadata"].(map[string]any)
+			locked, ok := metadata["tagsLocked"].(bool)
+			if !ok {
+				t.Errorf("metadata lock body = %#v", payload)
+				return
+			}
+			tagsLocked = locked
+			if locked {
+				puts = append(puts, "relock")
+				writeJSON(w, map[string]bool{"ok": true})
+				return
+			}
+			puts = append(puts, "unlock")
+			// The remote mutation has applied, but the response is ambiguous.
+			http.Error(w, "ambiguous response", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "user", "password", server.Client(), 1<<20, 1<<20, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.AddBookTagScoped(context.Background(), BookReference{LibraryID: "library-1", BookID: "book-1"}, "new")
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.Status != http.StatusInternalServerError {
+		t.Fatalf("ambiguous unlock error = %v", err)
+	}
+	if !reflect.DeepEqual(puts, []string{"unlock", "relock"}) || !tagsLocked {
+		t.Fatalf("ambiguous unlock cleanup puts=%v tagsLocked=%v", puts, tagsLocked)
+	}
+}
+
 func TestClientBookTagMutationClearsFinalTag(t *testing.T) {
 	currentTags := []string{"only"}
 	var updatedPayload map[string]any
@@ -781,7 +969,7 @@ func TestClientDownloadsBoundedContentAndUploadsExpectedMultipart(t *testing.T) 
 	if uploadValues.Get("isBook") != "true" || uploadValues.Get("bookType") != "AZW3" || filename != "book.azw3" {
 		t.Fatalf("multipart values=%v filename=%q", uploadValues, filename)
 	}
-	if err := client.UploadFileNamedScoped(context.Background(), reference, "azw3", uploadPath, "../Unsafe: Name.epub"); err != nil {
+	if err := client.UploadFileNamedScoped(context.Background(), reference, "azw3", uploadPath, `../nested\\Unsafe, Name.epub`); err != nil {
 		t.Fatal(err)
 	}
 	if filename != "Unsafe_ Name.azw3" {

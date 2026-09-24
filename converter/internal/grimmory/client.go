@@ -22,7 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
+
+	"converter/internal/artifactname"
 )
 
 var (
@@ -311,6 +312,10 @@ func (c *Client) SetBookTagScoped(ctx context.Context, reference BookReference, 
 	if err != nil {
 		return err
 	}
+	tagsLocked, _, err := metadataTagsLockedState(book)
+	if err != nil {
+		return err
+	}
 	if err := c.verifyBookMembership(ctx, reference); err != nil {
 		return err
 	}
@@ -336,23 +341,42 @@ func (c *Client) SetBookTagScoped(ctx context.Context, reference BookReference, 
 	if err != nil {
 		return fmt.Errorf("encode Grimmory metadata update: %w", err)
 	}
-	response, err := c.doWithPreflight(ctx, http.MethodPut, c.bookPath(reference.BookID)+"/metadata?replaceMode=REPLACE_WHEN_PROVIDED", func() (io.ReadCloser, string, error) {
-		return io.NopCloser(bytes.NewReader(encoded)), "application/json", nil
-	}, func(ctx context.Context) error {
-		return c.verifyBookMembership(ctx, reference)
-	})
-	if err != nil {
-		return err
-	}
-	responseBody, readErr := readBounded(response.Body, c.maxResponse)
-	closeErr := response.Body.Close()
-	if readErr != nil {
-		return readErr
-	}
-	if closeErr != nil {
+	updateTags := func(updateContext context.Context) error {
+		response, err := c.doWithPreflight(updateContext, http.MethodPut, c.bookPath(reference.BookID)+"/metadata?replaceMode=REPLACE_WHEN_PROVIDED", func() (io.ReadCloser, string, error) {
+			return io.NopCloser(bytes.NewReader(encoded)), "application/json", nil
+		}, func(preflightContext context.Context) error {
+			return c.verifyBookMembership(preflightContext, reference)
+		})
+		if err != nil {
+			return err
+		}
+		_, readErr := readBounded(response.Body, c.maxResponse)
+		closeErr := response.Body.Close()
+		if readErr != nil {
+			return readErr
+		}
 		return closeErr
 	}
-	_ = responseBody
+	if tagsLocked {
+		var primaryErr error
+		if unlockErr := c.setBookTagsLockedScoped(ctx, reference, false); unlockErr != nil {
+			primaryErr = unlockErr
+		} else {
+			primaryErr = updateTags(ctx)
+		}
+		relockErr := c.relockBookTags(reference, ctx)
+		if primaryErr != nil {
+			if relockErr != nil {
+				return errors.Join(primaryErr, fmt.Errorf("restore Grimmory tag lock: %w", relockErr))
+			}
+			return primaryErr
+		}
+		if relockErr != nil {
+			return fmt.Errorf("restore Grimmory tag lock: %w", relockErr)
+		}
+	} else if err := updateTags(ctx); err != nil {
+		return err
+	}
 	verified, err := c.GetBook(ctx, reference.BookID)
 	if err != nil {
 		return err
@@ -360,7 +384,26 @@ func (c *Client) SetBookTagScoped(ctx context.Context, reference BookReference, 
 	if !sameTagSet(normalizedTagSet(verified.Metadata.Tags), current) || (present && tagCount(verified, tag) != 1) || (!present && tagCount(verified, tag) != 0) {
 		return ErrTagVerification
 	}
+	if tagsLocked {
+		verifiedTagsLocked, present, err := metadataTagsLockedState(verified)
+		if err != nil {
+			return err
+		}
+		if !present || !verifiedTagsLocked {
+			return ErrTagVerification
+		}
+	}
 	return nil
+}
+
+func (c *Client) relockBookTags(reference BookReference, parent context.Context) error {
+	timeout := c.timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+	defer cancel()
+	return c.setBookTagsLockedScoped(ctx, reference, true)
 }
 
 func (c *Client) AddBookTagScoped(ctx context.Context, reference BookReference, tag string) error {
@@ -374,6 +417,30 @@ func (c *Client) RemoveBookTagScoped(ctx context.Context, reference BookReferenc
 func (c *Client) verifyBookMembership(ctx context.Context, reference BookReference) error {
 	_, err := c.GetLibraryBook(ctx, reference.LibraryID, reference.BookID)
 	return err
+}
+
+func (c *Client) setBookTagsLockedScoped(ctx context.Context, reference BookReference, locked bool) error {
+	encoded, err := json.Marshal(map[string]any{
+		"metadata":   map[string]any{"tagsLocked": locked},
+		"clearFlags": map[string]any{},
+	})
+	if err != nil {
+		return fmt.Errorf("encode Grimmory metadata lock update: %w", err)
+	}
+	response, err := c.doWithPreflight(ctx, http.MethodPut, c.bookPath(reference.BookID)+"/metadata?replaceMode=REPLACE_WHEN_PROVIDED", func() (io.ReadCloser, string, error) {
+		return io.NopCloser(bytes.NewReader(encoded)), "application/json", nil
+	}, func(preflightContext context.Context) error {
+		return c.verifyBookMembership(preflightContext, reference)
+	})
+	if err != nil {
+		return err
+	}
+	_, readErr := readBounded(response.Body, c.maxResponse)
+	closeErr := response.Body.Close()
+	if readErr != nil {
+		return readErr
+	}
+	return closeErr
 }
 
 func (c *Client) getBounded(ctx context.Context, requestPath string) ([]byte, error) {
@@ -791,7 +858,7 @@ func (c *Client) UploadFileScoped(ctx context.Context, reference BookReference, 
 		return err
 	}
 	format = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(format), "."))
-	return c.uploadFileScoped(ctx, reference, format, filePath, "book."+format)
+	return c.uploadFileScoped(ctx, reference, format, filePath, artifactname.OutputFilename("", format))
 }
 
 // UploadFileNamedScoped preserves the source filename during upload.
@@ -800,7 +867,7 @@ func (c *Client) UploadFileNamedScoped(ctx context.Context, reference BookRefere
 		return err
 	}
 	format = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(format), "."))
-	return c.uploadFileScoped(ctx, reference, format, filePath, safeUploadFilename(filename, format))
+	return c.uploadFileScoped(ctx, reference, format, filePath, artifactname.OutputFilename(filename, format))
 }
 
 // DeleteFileScoped deletes one exact file after proving that the referenced
@@ -1227,6 +1294,18 @@ func tagAlreadyDesired(book Book, tag string, present bool) bool {
 		return count == 1
 	}
 	return count == 0
+}
+
+func metadataTagsLockedState(book Book) (bool, bool, error) {
+	value, present := book.metadataSnapshot["tagsLocked"]
+	if !present {
+		return false, false, nil
+	}
+	locked, ok := value.(bool)
+	if !ok {
+		return false, true, fmt.Errorf("%w: Grimmory metadata tagsLocked is not boolean", ErrInvalidResponse)
+	}
+	return locked, true, nil
 }
 
 func tagCount(book Book, target string) int {
@@ -1836,10 +1915,11 @@ func readBounded(reader io.Reader, maxBytes int64) ([]byte, error) {
 }
 
 func multipartFileBody(filePath, format string, maxBytes int64) (io.ReadCloser, string, error) {
-	return multipartFileBodyNamed(filePath, format, "book."+format, maxBytes)
+	return multipartFileBodyNamed(filePath, format, artifactname.OutputFilename("", format), maxBytes)
 }
 
 func multipartFileBodyNamed(filePath, format, filename string, maxBytes int64) (io.ReadCloser, string, error) {
+	filename = artifactname.OutputFilename(filename, format)
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, "", fmt.Errorf("open upload file: %w", err)
@@ -1872,37 +1952,4 @@ func multipartFileBodyNamed(filePath, format, filename string, maxBytes int64) (
 		_ = writer.Close()
 	}()
 	return reader, multipartWriter.FormDataContentType(), nil
-}
-
-func safeUploadFilename(filename, format string) string {
-	base := path.Base(strings.ReplaceAll(strings.TrimSpace(filename), "\\", "/"))
-	if base == "." || base == ".." || base == "/" {
-		base = "book"
-	}
-	var builder strings.Builder
-	for _, char := range base {
-		switch {
-		case unicode.IsLetter(char), unicode.IsDigit(char):
-			builder.WriteRune(char)
-		case strings.ContainsRune(" .-_()[]{}", char):
-			builder.WriteRune(char)
-		default:
-			builder.WriteRune('_')
-		}
-	}
-	base = strings.Trim(builder.String(), " .")
-	if base == "" || base == "." || base == ".." {
-		base = "book"
-	}
-	if runes := []rune(base); len(runes) > 180 {
-		base = string(runes[:180])
-	}
-	stem := strings.TrimSuffix(base, path.Ext(base))
-	if stem == "" {
-		stem = "book"
-	}
-	if format == "" {
-		return stem
-	}
-	return stem + "." + format
 }

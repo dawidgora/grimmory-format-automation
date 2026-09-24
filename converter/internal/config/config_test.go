@@ -23,6 +23,9 @@ func TestLoadDefaults(t *testing.T) {
 	if join(cfg.LibraryIDs) != "1,2" || join(cfg.OutputFormats) != "mobi,azw3" || join(cfg.SupportedInputFormats) != "epub,azw3,mobi" || cfg.MaxConcurrentBooks != 1 {
 		t.Fatalf("format defaults = %+v", cfg)
 	}
+	if cfg.ExistingDerivativePolicy != "preserve" || cfg.DerivativeReplacementTag == "" {
+		t.Fatalf("derivative policy defaults = %+v", cfg)
+	}
 	if cfg.MaxFileBytes != 100<<20 || cfg.HTTPTimeout != 30*time.Second || cfg.PollInterval != 5*time.Minute || cfg.PollMaxAttempts != 5 || cfg.PollRetryBase != 30*time.Second || cfg.PollRetryMax != 15*time.Minute {
 		t.Fatalf("limit defaults = %+v", cfg)
 	}
@@ -161,6 +164,43 @@ func TestProcessingTagsMustDifferWhenBothAreSet(t *testing.T) {
 	}
 }
 
+func TestExistingDerivativePolicyAndReplacementTagAreValidated(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("GRIMMORY_BASE_URL", "https://grimmory.example")
+	t.Setenv("GRIMMORY_USERNAME", "user")
+	t.Setenv("GRIMMORY_PASSWORD", "password")
+	t.Setenv("LIBRARY_IDS", "1")
+	t.Setenv("EXISTING_DERIVATIVE_POLICY", "replace")
+	t.Setenv("DERIVATIVE_REPLACEMENT_TAG", "replace-me")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ExistingDerivativePolicy != "replace" || cfg.DerivativeReplacementTag != "replace-me" {
+		t.Fatalf("derivative settings = %+v", cfg)
+	}
+	for _, value := range []string{"always", "preserve-replace"} {
+		t.Setenv("EXISTING_DERIVATIVE_POLICY", value)
+		if _, err := Load(); err == nil {
+			t.Fatalf("accepted EXISTING_DERIVATIVE_POLICY=%q", value)
+		}
+	}
+	t.Setenv("EXISTING_DERIVATIVE_POLICY", "preserve")
+	for _, tag := range []string{"ignore", "failed"} {
+		t.Setenv("DERIVATIVE_REPLACEMENT_TAG", tag)
+		if tag == "ignore" {
+			t.Setenv("IGNORE_PROCESSING_TAG", tag)
+		} else {
+			t.Setenv("FAILED_PROCESSING_TAG", tag)
+		}
+		if _, err := Load(); err == nil {
+			t.Fatalf("accepted colliding DERIVATIVE_REPLACEMENT_TAG=%q", tag)
+		}
+		t.Setenv("IGNORE_PROCESSING_TAG", "")
+		t.Setenv("FAILED_PROCESSING_TAG", "")
+	}
+}
+
 func TestBaseURLAcceptsHTTPAndHTTPS(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -204,7 +244,7 @@ func clearConfigEnv(t *testing.T) {
 	for _, name := range []string{
 		"PORT", "ADDR", "DATA_DIR", "CALIBRE_BINARY", "LOG_LEVEL",
 		"GRIMMORY_BASE_URL", "GRIMMORY_USERNAME", "GRIMMORY_PASSWORD",
-		"LIBRARY_IDS", "OUTPUT_FORMATS", "SUPPORTED_INPUT_FORMATS", "IGNORE_PROCESSING_TAG", "FAILED_PROCESSING_TAG", "MAX_CONCURRENT_BOOKS", "MAX_FILE_BYTES", "MAX_RESPONSE_BYTES",
+		"LIBRARY_IDS", "OUTPUT_FORMATS", "SUPPORTED_INPUT_FORMATS", "IGNORE_PROCESSING_TAG", "FAILED_PROCESSING_TAG", "EXISTING_DERIVATIVE_POLICY", "DERIVATIVE_REPLACEMENT_TAG", "MAX_CONCURRENT_BOOKS", "MAX_FILE_BYTES", "MAX_RESPONSE_BYTES",
 		"HTTP_TIMEOUT", "CONVERSION_TIMEOUT", "DATABASE_BUSY_TIMEOUT",
 		"POLL_INTERVAL", "POLL_MAX_ATTEMPTS", "POLL_RETRY_BASE", "POLL_RETRY_MAX",
 	} {

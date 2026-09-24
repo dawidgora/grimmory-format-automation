@@ -59,17 +59,20 @@ func main() {
 	}
 	converter := convert.NewFileConverter(cfg.CalibreBinary, cfg.MaxFileBytes, nil)
 	service := reconcile.New(reconcile.Options{
-		Client:              client,
-		Store:               store,
-		Converter:           converter,
-		LibraryIDs:          cfg.LibraryIDs,
-		OutputFormats:       cfg.OutputFormats,
-		SupportedInputs:     cfg.SupportedInputFormats,
-		MaxConcurrentBooks:  cfg.MaxConcurrentBooks,
-		FailedProcessingTag: cfg.FailedProcessingTag,
-		MaxFileBytes:        cfg.MaxFileBytes,
-		ConversionTimeout:   cfg.ConversionTimeout,
-		Logger:              logger,
+		Client:                   client,
+		Store:                    store,
+		Converter:                converter,
+		LibraryIDs:               cfg.LibraryIDs,
+		OutputFormats:            cfg.OutputFormats,
+		SupportedInputs:          cfg.SupportedInputFormats,
+		MaxConcurrentBooks:       cfg.MaxConcurrentBooks,
+		FailedProcessingTag:      cfg.FailedProcessingTag,
+		IgnoreProcessingTag:      cfg.IgnoreProcessingTag,
+		ExistingDerivativePolicy: cfg.ExistingDerivativePolicy,
+		DerivativeReplacementTag: cfg.DerivativeReplacementTag,
+		MaxFileBytes:             cfg.MaxFileBytes,
+		ConversionTimeout:        cfg.ConversionTimeout,
+		Logger:                   logger,
 	})
 	var poller *polling.Scheduler
 	if poll {
