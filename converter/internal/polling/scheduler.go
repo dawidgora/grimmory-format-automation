@@ -37,14 +37,6 @@ type Store interface {
 	RecordPollFailure(context.Context, string, string, string, string, time.Time, int, time.Time) (state.PollState, error)
 }
 
-type PendingReplacementStore interface {
-	HasPendingReplacementTag(context.Context, string, string) (bool, error)
-}
-
-type PendingPollStore interface {
-	MarkPollPending(context.Context, string, string, string, time.Time) (state.PollState, error)
-}
-
 type Options struct {
 	Remote              Remote
 	Store               Store
@@ -237,18 +229,7 @@ func (s *Scheduler) Scan(ctx context.Context) (scanErr error) {
 				appendError(fmt.Errorf("library %s book %s failed membership validation", libraryID, bookID))
 				continue
 			}
-			pendingCleanup := false
-			if pendingStore, ok := s.store.(PendingReplacementStore); ok {
-				pendingCleanup, err = pendingStore.HasPendingReplacementTag(ctx, libraryID, bookID)
-				if err != nil {
-					if ctx.Err() != nil {
-						return ctx.Err()
-					}
-					s.logBookFailure(libraryID, bookID, "poll pending cleanup state failed", err)
-					continue
-				}
-			}
-			if hasTag(book, s.ignoreTag) && !pendingCleanup {
+			if hasTag(book, s.ignoreTag) {
 				summary.bookIgnored()
 				if err := s.clearFailureTagForIgnored(ctx, libraryID, bookID, book); err != nil {
 					if ctx.Err() != nil {
@@ -267,20 +248,6 @@ func (s *Scheduler) Scan(ctx context.Context) (scanErr error) {
 				s.logBookFailure(libraryID, bookID, "poll observation failed", err)
 				appendError(fmt.Errorf("upsert poll observation %s/%s: %w", libraryID, bookID, err))
 				continue
-			}
-			if pendingCleanup {
-				pendingStore, ok := s.store.(PendingPollStore)
-				if !ok {
-					s.logBookFailure(libraryID, bookID, "poll durable replacement state unsupported", errors.New("poll pending state mutation is unsupported"))
-					continue
-				}
-				if _, err := pendingStore.MarkPollPending(ctx, libraryID, bookID, fingerprint, seenAt); err != nil {
-					if ctx.Err() != nil {
-						return ctx.Err()
-					}
-					s.logBookFailure(libraryID, bookID, "poll durable replacement state failed", err)
-					continue
-				}
 			}
 			ready[pollKey(libraryID, bookID)] = struct{}{}
 		}
@@ -634,9 +601,6 @@ func IsTransient(err error) bool {
 		return httpError.Status == 408 || httpError.Status == 425 || httpError.Status == 429 || httpError.Status >= 500
 	}
 	if errors.Is(err, reconcile.ErrVerification) {
-		return true
-	}
-	if errors.Is(err, reconcile.ErrReplacementTagMutation) {
 		return true
 	}
 	return isSQLiteBusy(err)

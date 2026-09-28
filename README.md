@@ -36,16 +36,15 @@ flowchart LR
 - `force=true` on a sync explicitly rebuilds the configured derivatives for
   that request and authorizes destructive replacement of existing derivatives,
   including ones that are not stale.
-- `DERIVATIVE_REPLACEMENT_TAG` is a per-book authorization for stale
-  replacements while the policy is `preserve`. It is one-shot: the service
-  removes the tag only after a successful sync actually replaces a stale
-  derivative under that authorization. A sync that only creates missing
-  derivatives, preserves current derivatives, or fails before replacement does
-  not consume it. Wait for the service to remove the tag before adding the same
-  tag again.
+- `DERIVATIVE_REPLACEMENT_TAG` is a persistent, user-managed per-book
+  authorization for stale replacements while the policy is `preserve`. It is
+  never auto-consumed; remove the tag when it should no longer authorize
+  replacement.
 - Replacing an existing derivative is a delete-then-upload sequence and is not
-  atomic. The service minimizes the gap and uses recovery handling, but an
-  interruption or failure can leave the derivative absent.
+  atomic. Safe fresh retries rely on Grimmory's confirmed guarantees that
+  inventory is read-after-write consistent and that one file per book/format is
+  enforced. An interruption can leave the output absent; the next unignored
+  sync starts fresh from Grimmory's remote inventory.
 
 ## Installation
 
@@ -59,7 +58,6 @@ services:
   grimmory-format-service:
     image: ghcr.io/dawidgora/grimmory-format-automation:latest
     restart: unless-stopped
-    stop_grace_period: 31m
     # Remove `command: ["--poll"]` for manual-only operation.
     command: ["--poll"]
     ports:
@@ -82,10 +80,8 @@ volumes:
   converter_data:
 ```
 
-Both Compose files publish the API on the configured host port and allow 31
-minutes for graceful shutdown. Adjust the host binding to choose network
-exposure. This covers three sequential 10-minute conversions and 30 seconds for
-HTTP shutdown.
+Both Compose files publish the API on the configured host port. Adjust the host
+binding to choose network exposure.
 
 - Start the service:
 
@@ -160,7 +156,7 @@ and timeouts, such as `30s`, `1m`, or `1h`.
 | `OUTPUT_FORMATS` | `mobi,azw3` | Non-empty output format list. Separate values with commas or whitespace. Each format can use up to 32 characters. |
 | `SUPPORTED_INPUT_FORMATS` | `epub,azw3,mobi` | Non-empty input format list. Separate values with commas or whitespace. Each format can use up to 32 characters. |
 | `EXISTING_DERIVATIVE_POLICY` | `preserve` | `preserve` keeps existing derivatives unless they are stale and an explicit authorization is supplied; `replace` globally authorizes replacement only for derivatives already found stale. |
-| `DERIVATIVE_REPLACEMENT_TAG` | `derivative-replacement` | Per-book, one-shot authorization for stale replacement under `preserve`. It is removed only after a successful sync actually replaces a stale derivative under that authorization; wait for removal before re-adding it. |
+| `DERIVATIVE_REPLACEMENT_TAG` | `derivative-replacement` | Persistent, user-managed per-book authorization for stale replacement under `preserve`; it is never auto-consumed. Remove the tag when it should no longer authorize replacement. |
 | `IGNORE_PROCESSING_TAG` | disabled | Tag to skip. A blank value disables it. |
 | `FAILED_PROCESSING_TAG` | disabled | Tag for polling failures after all attempts. A blank value disables it. |
 | `MAX_CONCURRENT_BOOKS` | `1` | Concurrent book syncs: `1`–`16`. |
