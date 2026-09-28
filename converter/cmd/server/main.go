@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sync"
 	"syscall"
 	"time"
 
@@ -25,6 +24,8 @@ import (
 	"converter/internal/reconcile"
 	"converter/internal/state"
 )
+
+const httpShutdownAllowance = 5 * time.Second
 
 func main() {
 	poll, err := parsePollFlag(os.Args[1:])
@@ -96,46 +97,46 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	handlerCtx, cancelHandlers := context.WithCancel(context.Background())
-	defer cancelHandlers()
 	api := httpapi.NewWithLogger(apiKey, service, logger)
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           api.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       cfg.HTTPTimeout,
-		// Allow all sequential conversions in a valid one-book sync to complete.
+		// Conversions can outlast ordinary response timeouts; shutdown cancels their handlers.
 		WriteTimeout: 0,
 		IdleTimeout:  60 * time.Second,
-		BaseContext:  func(net.Listener) context.Context { return handlerCtx },
+		BaseContext:  func(net.Listener) context.Context { return ctx },
 	}
 
-	var pollWG sync.WaitGroup
+	pollDone := make(chan struct{})
 	if poller != nil {
-		pollWG.Add(1)
 		go func() {
-			defer pollWG.Done()
+			defer close(pollDone)
 			if err := poller.Run(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				logger.Log(logging.Error, logging.Field{Key: "message", Value: "poll loop stopped"}, logging.Field{Key: "error_class", Value: reconcile.ClassifyError(err)})
 			}
 		}()
+	} else {
+		close(pollDone)
 	}
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
 		<-ctx.Done()
-		// Allow time for the main and configured derivative conversions.
-		shutdownWindow := cfg.ConversionTimeout*time.Duration(len(cfg.OutputFormats)+1) + cfg.HTTPTimeout
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownWindow)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), httpShutdownAllowance)
 		defer cancel()
 		if shutdownErr := server.Shutdown(shutdownCtx); shutdownErr != nil {
 			logger.Log(logging.Error, logging.Field{Key: "message", Value: "server shutdown"}, logging.Field{Key: "error", Value: shutdownErr.Error()})
 			if errors.Is(shutdownErr, context.DeadlineExceeded) {
-				cancelHandlers()
 				if closeErr := server.Close(); closeErr != nil {
 					logger.Log(logging.Error, logging.Field{Key: "message", Value: "server close"}, logging.Field{Key: "error", Value: closeErr.Error()})
 				}
 			}
+		}
+		select {
+		case <-pollDone:
+		case <-shutdownCtx.Done():
 		}
 	}()
 
@@ -144,9 +145,8 @@ func main() {
 		log.Fatal(err)
 	}
 	if ctx.Err() != nil {
-		// Wait for active handlers before closing state.
+		// Wait for shutdown bookkeeping before closing state.
 		<-shutdownDone
-		pollWG.Wait()
 	}
 }
 

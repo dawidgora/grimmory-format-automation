@@ -64,8 +64,17 @@ type endpointStore struct{}
 func (endpointStore) Get(context.Context, string, string) (state.BookState, map[string]state.DerivedState, error) {
 	return state.BookState{}, map[string]state.DerivedState{}, nil
 }
-func (endpointStore) SetBook(context.Context, state.BookState) error       { return nil }
-func (endpointStore) SetDerived(context.Context, state.DerivedState) error { return nil }
+func (endpointStore) SetBook(context.Context, state.BookState) error { return nil }
+func (endpointStore) SetDerived(context.Context, state.DerivedState) error {
+	return nil
+}
+func (endpointStore) GetDerivedUploadReceipts(context.Context, string, string) (map[string]state.DerivedUploadReceipt, error) {
+	return map[string]state.DerivedUploadReceipt{}, nil
+}
+func (endpointStore) SetDerivedUploadReceipt(context.Context, state.DerivedUploadReceipt) error {
+	return nil
+}
+func (endpointStore) CommitDerived(context.Context, state.DerivedState) error { return nil }
 
 type endpointConverter struct{}
 
