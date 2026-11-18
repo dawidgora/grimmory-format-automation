@@ -196,3 +196,7 @@ DERIVATIVE_REPLACEMENT_TAG=derivative-replacement
 # Alternative: globally authorize replacements after derivatives are found stale.
 # EXISTING_DERIVATIVE_POLICY=replace
 ```
+
+## Support
+
+[<img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" height="50" alt="Buy Me A Coffee">](https://buymeacoffee.com/dawidgora)
