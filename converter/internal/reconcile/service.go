@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -32,7 +31,6 @@ var (
 	ErrState                      = errors.New("reconciliation state operation failed")
 	ErrLibraryNotAllowed          = errors.New("library is not allowed")
 	ErrFailureTagMutation         = errors.New("failure tag mutation failed")
-	ErrReplacementTagMutation     = errors.New("derivative replacement tag mutation failed")
 	ErrSafeReplacementUnavailable = errors.New("safe replacement unavailable")
 )
 
@@ -62,8 +60,6 @@ func ClassifyError(err error) string {
 		return "state"
 	case errors.Is(err, ErrFailureTagMutation):
 		return "failure_tag_mutation"
-	case errors.Is(err, ErrReplacementTagMutation):
-		return "replacement_tag_mutation"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "timeout"
 	case errors.Is(err, context.Canceled):
@@ -136,35 +132,9 @@ type Store interface {
 	Get(context.Context, string, string) (state.BookState, map[string]state.DerivedState, error)
 	SetBook(context.Context, state.BookState) error
 	SetDerived(context.Context, state.DerivedState) error
-}
-
-// UploadIntentStore is implemented by the SQLite store. It is optional at the
-// interface boundary so small integrations that only need the original Store
-// methods remain source compatible, while the production store still gets
-// durable recovery semantics.
-type UploadIntentStore interface {
-	GetDerivedUploadIntents(context.Context, string, string) (map[string]state.DerivedUploadIntent, error)
-	SetDerivedUploadIntent(context.Context, state.DerivedUploadIntent) error
-}
-
-type DerivedCommitStore interface {
-	CommitDerived(context.Context, state.DerivedState, string) error
-}
-
-type PendingReplacementStore interface {
-	ClearPendingReplacementTag(context.Context, string, string, string) error
-}
-
-type PendingReplacementMarkerStore interface {
-	MarkPendingReplacementCleanup(context.Context, string, string, string) error
-}
-
-type ReplacementProgressStore interface {
-	MarkReplacementInProgress(context.Context, string, string, string) error
-}
-
-type ReplacementPreparationStore interface {
-	PrepareReplacement(context.Context, state.DerivedUploadIntent) error
+	GetDerivedUploadReceipts(context.Context, string, string) (map[string]state.DerivedUploadReceipt, error)
+	SetDerivedUploadReceipt(context.Context, state.DerivedUploadReceipt) error
+	CommitDerived(context.Context, state.DerivedState) error
 }
 
 type Options struct {
@@ -437,15 +407,7 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 		result.Error = "state_read_failed"
 		return result, fmt.Errorf("%w: %v", ErrState, err)
 	}
-	if savedBook.PendingReplacementTag != "" {
-		if options.DryRun {
-			result.Status = "dry_run"
-			result.Main = ItemResult{Action: "cleanup", Status: "planned", Reason: "pending_replacement_cleanup"}
-			return result, nil
-		}
-		return s.finishPendingReplacementCleanup(ctx, libraryID, bookID, book, savedBook, result)
-	}
-	if hasTag(book, s.ignoreTag) && !savedBook.ReplacementInProgress {
+	if hasTag(book, s.ignoreTag) {
 		result.Status = "ignored"
 		return result, nil
 	}
@@ -454,22 +416,23 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 		result.Error = "library_policy_failed"
 		return result, err
 	}
-	replacementAllowed := s.replacementAllowedForState(book, savedBook, options)
-	replacementTagRequested := (s.replacementTag != "" && hasTag(book, s.replacementTag)) || savedBook.ReplacementInProgressTag != ""
-	replacementTag := s.replacementTag
-	if savedBook.ReplacementInProgressTag != "" {
-		replacementTag = savedBook.ReplacementInProgressTag
-	}
-	uploadIntents, err := s.getUploadIntents(ctx, libraryID, bookID)
+	replacementAllowed := s.replacementAllowed(book, options)
+	uploadReceipts, err := s.store.GetDerivedUploadReceipts(ctx, libraryID, bookID)
 	if err != nil {
 		result.Error = "state_read_failed"
 		return result, fmt.Errorf("%w: %v", ErrState, err)
 	}
-	if savedBook.ReplacementInProgress && len(uploadIntents) == 0 {
-		result.Status, result.Error = "partial", SafeReplacementUnavailableCode
-		return result, newPartialError(ErrSafeReplacementUnavailable)
+	mainCandidates := filesForFormat(book.Files, policy.MainFormat)
+	if len(mainCandidates) > 1 {
+		result.Main = ItemResult{Format: policy.MainFormat, Action: "blocked", Status: "blocked", Error: SafeReplacementUnavailableCode}
+		result.Error = SafeReplacementUnavailableCode
+		return result, ErrSafeReplacementUnavailable
 	}
-	mainFile, hasMain := FindFile(book.Files, policy.MainFormat)
+	var mainFile grimmory.File
+	hasMain := len(mainCandidates) == 1
+	if hasMain {
+		mainFile = mainCandidates[0]
+	}
 	if !hasMain {
 		source, ok := SelectSource(book.Files, policy.MainFormat, policy.FallbackFormats)
 		if !ok {
@@ -482,15 +445,19 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 		}
 		result.Main = ItemResult{Format: policy.MainFormat, SourceFormat: source.Format, Action: "create", Status: "planned", Reason: "main_missing"}
 		if options.DryRun {
-			replacementOwner, _ := replacementOwnerFormat(savedBook, uploadIntents)
 			for _, format := range policy.OutputFormats {
 				action := "create"
-				if _, exists := FindFile(book.Files, format); exists {
+				candidates := filesForFormat(book.Files, format)
+				if len(candidates) > 1 {
+					result.Derivatives = append(result.Derivatives, ItemResult{Format: format, SourceFormat: policy.MainFormat, Action: "blocked", Status: "blocked", Reason: "ambiguous_output", Error: SafeReplacementUnavailableCode})
+					result.Error = SafeReplacementUnavailableCode
+					continue
+				}
+				if len(candidates) == 1 {
 					action = "rebuild"
 				}
 				item := ItemResult{Format: format, SourceFormat: policy.MainFormat, Action: action, Status: "planned", Reason: "main_would_be_created"}
-				allowedForFormat := s.replacementAllowedForFormat(book, savedBook, replacementOwner, format, options)
-				if action == "rebuild" && !allowedForFormat {
+				if action == "rebuild" && !replacementAllowed {
 					item.Status = "blocked"
 					item.Error = SafeReplacementUnavailableCode
 					result.Error = SafeReplacementUnavailableCode
@@ -539,7 +506,7 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 		canonicalMTime, canonicalTrustedMTime = savedBook.CanonicalMTime, true
 	}
 	if !options.DryRun {
-		canonicalState = state.BookState{LibraryID: libraryID, BookID: bookID, MainFormat: policy.MainFormat, CanonicalFormat: policy.MainFormat, CanonicalFileID: mainFile.ID, CanonicalFileName: canonicalName, CanonicalSHA256: canonicalSHA, MetadataFingerprint: mainFile.MetadataFingerprint, CanonicalMTime: canonicalMTime, TrustedMTime: canonicalTrustedMTime, LastSuccessfulSync: savedBook.LastSuccessfulSync, PendingReplacementTag: savedBook.PendingReplacementTag, ReplacementInProgressTag: savedBook.ReplacementInProgressTag, ReplacementInProgress: savedBook.ReplacementInProgress, UpdatedAt: time.Now().UTC()}
+		canonicalState = state.BookState{LibraryID: libraryID, BookID: bookID, MainFormat: policy.MainFormat, CanonicalFormat: policy.MainFormat, CanonicalFileID: mainFile.ID, CanonicalFileName: canonicalName, CanonicalSHA256: canonicalSHA, MetadataFingerprint: mainFile.MetadataFingerprint, CanonicalMTime: canonicalMTime, TrustedMTime: canonicalTrustedMTime, LastSuccessfulSync: savedBook.LastSuccessfulSync, UpdatedAt: time.Now().UTC()}
 		if err := s.store.SetBook(ctx, canonicalState); err != nil {
 			result.Error = "state_write_failed"
 			return result, fmt.Errorf("%w: %v", ErrState, err)
@@ -547,16 +514,10 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 	}
 	generationFingerprints := DesiredGenerationFingerprints(book, canonicalSHA, canonicalName, policy.OutputFormats)
 	plans := PlanDerivatives(book.Files, policy.OutputFormats, policy.MainFormat, canonicalSHA, savedDerived, canonicalMTime, canonicalTrustedMTime, false, options.Force, false, generationFingerprints, canonicalName)
-	plans, replacementOwner, ownerReady := prioritizeReplacementOwner(savedBook, uploadIntents, plans)
-	if savedBook.ReplacementInProgress && !ownerReady {
-		result.Status, result.Error = "partial", SafeReplacementUnavailableCode
-		return result, newPartialError(ErrSafeReplacementUnavailable)
-	}
 	if options.DryRun {
 		for _, plan := range plans {
 			item := ItemResult{Format: plan.Format, SourceFormat: policy.MainFormat, Action: plan.Action, Status: "planned", Reason: plan.Reason}
-			allowedForFormat := s.replacementAllowedForFormat(book, savedBook, replacementOwner, plan.Format, options)
-			if plan.Blocked && !allowedForFormat {
+			if plan.Unsafe || (plan.Blocked && !replacementAllowed) {
 				item.Status = "blocked"
 				item.Error = SafeReplacementUnavailableCode
 				result.Error = SafeReplacementUnavailableCode
@@ -570,132 +531,116 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 	blocked := false
 	stopFurther := false
 	var firstFailure error
-	pendingCleanupTag := savedBook.ReplacementInProgressTag
-	replacementAuthorizedState := savedBook.ReplacementInProgress || pendingCleanupTag != ""
-	phaseCleared := false
-	completionCtx := ctx
-	var completionCancel context.CancelFunc
-	defer func() {
-		if completionCancel != nil {
-			completionCancel()
-		}
-	}()
 	expectedBook := book
-	for _, plan := range plans {
+	for _, initialPlan := range plans {
 		if stopFurther {
 			break
 		}
-		if phaseCleared {
-			if s.ignoreTag != "" {
-				refreshedBook, ignored, refreshErr := s.refreshBookBeforeNextDerivative(ctx, libraryID, bookID)
-				if refreshErr != nil {
-					result.Status, result.Error = "partial", codeForError(refreshErr, "verification_failed")
-					return result, newPartialError(refreshErr)
-				}
-				expectedBook = refreshedBook
-				if ignored {
-					result.Status = "ignored"
-					return result, nil
-				}
+		refreshedBook, ignored, refreshErr := s.refreshBookBeforeNextDerivative(ctx, libraryID, bookID)
+		if refreshErr != nil {
+			result.Status, result.Error = "partial", codeForError(refreshErr, "verification_failed")
+			return result, newPartialError(refreshErr)
+		}
+		expectedBook = refreshedBook
+		if ignored {
+			result.Status = "ignored"
+			return result, nil
+		}
+		if err := validateCanonicalBook(refreshedBook, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, policy.MainFormat, mainFile); err != nil {
+			item := ItemResult{Format: initialPlan.Format, SourceFormat: policy.MainFormat, Action: initialPlan.Action, Status: "blocked", Reason: "canonical_changed", Error: SafeReplacementUnavailableCode}
+			result.Derivatives = append(result.Derivatives, item)
+			failed, blocked, stopFurther = true, true, true
+			if firstFailure == nil {
+				firstFailure = err
 			}
-			phaseCleared = false
+			continue
 		}
-		replacementAllowed = s.replacementAllowedForState(expectedBook, savedBook, options)
-		replacementTagRequested = (s.replacementTag != "" && hasTag(expectedBook, s.replacementTag)) || savedBook.ReplacementInProgressTag != ""
-		replacementTag = s.replacementTag
-		if savedBook.ReplacementInProgressTag != "" {
-			replacementTag = savedBook.ReplacementInProgressTag
+		if err := verifyLocalCanonicalUnchanged(canonicalPath, canonicalSHA, s.maxFileBytes); err != nil {
+			item := ItemResult{Format: initialPlan.Format, SourceFormat: policy.MainFormat, Action: initialPlan.Action, Status: "blocked", Reason: "canonical_changed", Error: codeForError(err, SafeReplacementUnavailableCode)}
+			result.Derivatives = append(result.Derivatives, item)
+			failed, stopFurther = true, true
+			if errors.Is(err, ErrSafeReplacementUnavailable) {
+				blocked = true
+			}
+			if firstFailure == nil {
+				firstFailure = err
+			}
+			continue
 		}
-		isReplacementOwner := replacementOwner != "" && normalizeFormat(plan.Format) == replacementOwner
-		if savedBook.ReplacementInProgress && replacementOwner != "" && !isReplacementOwner {
-			stopFurther = true
-			break
+		if err := s.verifyCanonicalUnchanged(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, policy.MainFormat, canonicalSHA, workspace, initialPlan.Format); err != nil {
+			item := ItemResult{Format: initialPlan.Format, SourceFormat: policy.MainFormat, Action: initialPlan.Action, Status: "blocked", Reason: "canonical_changed", Error: codeForError(err, SafeReplacementUnavailableCode)}
+			result.Derivatives = append(result.Derivatives, item)
+			failed, stopFurther = true, true
+			if errors.Is(err, ErrSafeReplacementUnavailable) {
+				blocked = true
+			}
+			if firstFailure == nil {
+				firstFailure = err
+			}
+			continue
 		}
+		currentPlans := PlanDerivatives(refreshedBook.Files, []string{initialPlan.Format}, policy.MainFormat, canonicalSHA, savedDerived, canonicalMTime, canonicalTrustedMTime, false, options.Force, false, generationFingerprints, canonicalName)
+		if len(currentPlans) != 1 {
+			err := fmt.Errorf("%w: no current derivative plan", ErrSafeReplacementUnavailable)
+			item := ItemResult{Format: initialPlan.Format, SourceFormat: policy.MainFormat, Action: initialPlan.Action, Status: "blocked", Reason: "current_inventory_unavailable", Error: SafeReplacementUnavailableCode}
+			result.Derivatives = append(result.Derivatives, item)
+			failed, blocked = true, true
+			if firstFailure == nil {
+				firstFailure = err
+			}
+			continue
+		}
+		plan := currentPlans[0]
+		replacementAllowed = s.replacementAllowed(refreshedBook, options)
 		item := ItemResult{Format: plan.Format, SourceFormat: policy.MainFormat, Action: plan.Action, Reason: plan.Reason}
-		intent, hasIntent := uploadIntents[plan.Format]
-		if isReplacementOwner && savedBook.ReplacementInProgress && hasIntent && plan.Action == "unchanged" {
-			plan.Action, plan.Reason, plan.Blocked = "rebuild", "replacement_in_progress", true
-			item.Action, item.Reason = plan.Action, plan.Reason
+		if plan.Unsafe {
+			item.Status = "blocked"
+			item.Error = SafeReplacementUnavailableCode
+			failed, blocked = true, true
+			if firstFailure == nil {
+				firstFailure = ErrSafeReplacementUnavailable
+			}
+			result.Derivatives = append(result.Derivatives, item)
+			continue
 		}
 		if plan.Action == "unchanged" {
 			item.Status = "unchanged"
 			result.Derivatives = append(result.Derivatives, item)
 			continue
 		}
-		before, hadBefore := FindFile(expectedBook.Files, plan.Format)
-		resumeDestructive := isReplacementOwner && savedBook.ReplacementInProgress && hasIntent && replacementTargetMatches(expectedBook.Files, plan.Format, intent)
-		safeMissingRecovery := isReplacementOwner && savedBook.ReplacementInProgress && hasIntent && replacementTargetMissing(expectedBook.Files, plan.Format, intent)
-		if isReplacementOwner && savedBook.ReplacementInProgress && !hasIntent {
-			failed = true
-			blocked = true
-			stopFurther = true
-			firstFailure = ErrSafeReplacementUnavailable
-			item.Status, item.Error = "blocked", SafeReplacementUnavailableCode
-			result.Derivatives = append(result.Derivatives, item)
-			continue
+		targetCandidates := filesForFormat(refreshedBook.Files, plan.Format)
+		var before grimmory.File
+		hadBefore := len(targetCandidates) == 1
+		if hadBefore {
+			before = targetCandidates[0]
 		}
-		needsIntentRecovery := hasIntent && !resumeDestructive && !safeMissingRecovery && ((isReplacementOwner && savedBook.ReplacementInProgress) || (plan.Blocked && !options.Force) || plan.Action == "create")
-		if needsIntentRecovery {
-			if hasIntent {
-				candidate, recoveredBook, recoverable, recoveryErr := s.recoverableIntentCandidate(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, workspace, expectedBook, mainFile, plan, intent, canonicalSHA, canonicalName, policy.MainFormat)
-				if recoveryErr != nil {
-					failed = true
-					stopFurther = true
+		if receipt, hasReceipt := uploadReceipts[plan.Format]; hasReceipt {
+			candidate, recoveredBook, recoverable, recoveryErr := s.recoverableReceiptCandidate(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, workspace, mainFile, plan, receipt, canonicalSHA, canonicalName, policy.MainFormat)
+			if recoveryErr != nil {
+				failed, stopFurther = true, true
+				if firstFailure == nil {
+					firstFailure = recoveryErr
+				}
+				item.Status, item.Error = "failed", codeForError(recoveryErr, "derivative_failed")
+				result.Derivatives = append(result.Derivatives, item)
+				continue
+			}
+			if recoverable {
+				if err := s.commitDerived(ctx, adoptedDerivedState(libraryID, bookID, plan, candidate, receipt)); err != nil {
+					stateErr := fmt.Errorf("%w: %v", ErrState, err)
+					failed, stopFurther = true, true
 					if firstFailure == nil {
-						firstFailure = recoveryErr
+						firstFailure = stateErr
 					}
-					item.Status = "failed"
-					item.Error = codeForError(recoveryErr, "derivative_failed")
+					item.Status, item.Error = "failed", codeForError(stateErr, "state_write_failed")
 					result.Derivatives = append(result.Derivatives, item)
 					continue
 				}
-				if recoverable {
-					adopted := adoptedDerivedState(libraryID, bookID, plan, candidate, intent)
-					if err := s.commitDerived(ctx, adopted, intent.ReplacementTag); err != nil {
-						stateErr := fmt.Errorf("%w: %v", ErrState, err)
-						failed = true
-						stopFurther = true
-						if firstFailure == nil {
-							firstFailure = stateErr
-						}
-						item.Status = "failed"
-						item.Error = codeForError(stateErr, "state_write_failed")
-						result.Derivatives = append(result.Derivatives, item)
-						continue
-					}
-					item.Status, item.Reason = "adopted", "upload_intent_recovered"
-					if intent.ReplacementTag != "" {
-						pendingCleanupTag = intent.ReplacementTag
-						savedBook.ReplacementInProgressTag = intent.ReplacementTag
-						replacementAuthorizedState = true
-					}
-					if isReplacementOwner && savedBook.ReplacementInProgress {
-						savedBook.ReplacementInProgress = false
-						replacementAuthorizedState = pendingCleanupTag != ""
-						phaseCleared = true
-					}
-					expectedBook = recoveredBook
-					result.Derivatives = append(result.Derivatives, item)
-					continue
-				}
-				if isReplacementOwner && savedBook.ReplacementInProgress {
-					failed = true
-					blocked = true
-					stopFurther = true
-					firstFailure = ErrSafeReplacementUnavailable
-					item.Status, item.Error = "blocked", SafeReplacementUnavailableCode
-					result.Derivatives = append(result.Derivatives, item)
-					continue
-				}
-				if plan.Blocked && !options.Force && len(filesForFormat(expectedBook.Files, plan.Format)) > 0 {
-					failed = true
-					blocked = true
-					stopFurther = true
-					firstFailure = ErrSafeReplacementUnavailable
-					item.Status, item.Error = "blocked", SafeReplacementUnavailableCode
-					result.Derivatives = append(result.Derivatives, item)
-					continue
-				}
+				item.Status, item.Reason = "adopted", "upload_receipt_recovered"
+				expectedBook = recoveredBook
+				savedDerived[plan.Format] = adoptedDerivedState(libraryID, bookID, plan, candidate, receipt)
+				result.Derivatives = append(result.Derivatives, item)
+				continue
 			}
 		}
 		if plan.Blocked && !replacementAllowed {
@@ -710,14 +655,11 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 			continue
 		}
 		item.Status = "failed"
-		uploadAttempted := false
-		tagAuthorized := replacementTagRequested && !options.Force && s.existingPolicy != "replace" && plan.Blocked && hadBefore
-		intent = uploadIntentFor(libraryID, bookID, plan, canonicalName, canonicalSHA, mainFile, stableInventoryFingerprint(expectedBook.Files, plan.Format), tagAuthorized, replacementTag)
-		if safeMissingRecovery {
-			intent = preservePreparedReplacementEvidence(uploadIntents[plan.Format], intent)
-		}
+		receipt := uploadReceiptFor(libraryID, bookID, plan, canonicalName, canonicalSHA)
 		outputPath, conversionErr := s.convert(ctx, canonicalPath, policy.MainFormat, plan.Format, workspace)
 		var outputSHA string
+		mutationAttempted := false
+		adoptedFromReceipt := false
 		if conversionErr == nil {
 			if !withinWorkspace(workspace, outputPath) {
 				conversionErr = errors.New("converter output escaped workspace")
@@ -726,57 +668,50 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 			}
 		}
 		if conversionErr == nil {
-			intent.OutputSHA256 = outputSHA
+			receipt.OutputSHA256 = outputSHA
 		}
-		operationCtx := ctx
-		var operationCancel context.CancelFunc
-		destructiveOperation := false
 		if conversionErr == nil {
-			uploadAttempted = true
-			destructiveOperation, operationCtx, operationCancel, conversionErr = s.uploadDerivative(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, plan, before, hadBefore, expectedBook, policy.MainFormat, mainFile, canonicalSHA, workspace, outputPath, canonicalName, options, intent, replacementAuthorizedState)
-			if destructiveOperation {
-				savedBook.ReplacementInProgress = true
+			mutationAttempted, conversionErr = s.uploadDerivative(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, plan, before, hadBefore, refreshedBook, policy.MainFormat, mainFile, canonicalSHA, workspace, outputPath, canonicalName, options, receipt)
+			if conversionErr != nil && ctx.Err() == nil {
+				if candidate, recoveredBook, recoverable, recoveryErr := s.recoverableReceiptCandidate(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, workspace, mainFile, plan, receipt, canonicalSHA, canonicalName, policy.MainFormat); recoveryErr == nil && recoverable {
+					adopted := adoptedDerivedState(libraryID, bookID, plan, candidate, receipt)
+					if commitErr := s.commitDerived(ctx, adopted); commitErr == nil {
+						conversionErr = nil
+						item.Status, item.Reason = "adopted", "upload_receipt_recovered"
+						expectedBook = recoveredBook
+						savedDerived[plan.Format] = adopted
+						mutationAttempted = false
+						adoptedFromReceipt = true
+					}
+				}
 			}
 		}
-		if conversionErr == nil {
-			verifiedBook, verifyErr := s.client.GetLibraryBook(operationCtx, libraryID, bookID)
+		if conversionErr == nil && !adoptedFromReceipt {
+			verifiedBook, verifyErr := s.client.GetLibraryBook(ctx, libraryID, bookID)
 			if verifyErr != nil {
 				conversionErr = verifyErr
 			} else if verifiedFile, ok := findUploadedFile(verifiedBook.Files, plan.Format, desiredOutputName(canonicalName, plan.Format)); !ok {
 				conversionErr = ErrVerification
-			} else if conversionErr = s.verifyUploadedFile(operationCtx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, before, hadBefore, verifiedFile, outputSHA, workspace, verifiedBook.Files, mainFile.ID); conversionErr != nil {
-			} else if conversionErr = s.revalidateCanonicalSource(operationCtx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, policy.MainFormat, mainFile, canonicalSHA, canonicalPath, workspace, plan.Format, verifiedBook); conversionErr != nil {
+			} else if conversionErr = s.verifyUploadedFile(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, before, hadBefore, verifiedFile, outputSHA, workspace, verifiedBook.Files, mainFile.ID); conversionErr != nil {
+			} else if conversionErr = s.revalidateCanonicalSource(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, policy.MainFormat, mainFile, canonicalSHA, canonicalPath, workspace, plan.Format, verifiedBook); conversionErr != nil {
 			} else {
-				if err := s.commitDerived(operationCtx, state.DerivedState{LibraryID: libraryID, BookID: bookID, Format: plan.Format, GrimmoryFileID: verifiedFile.ID, SourceSHA256: canonicalSHA, OutputSHA256: outputSHA, GenerationFingerprint: plan.GenerationFingerprint, TrustedMTime: verifiedFile.MTime, HasMTime: verifiedFile.TrustedMTime, GeneratedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}, intent.ReplacementTag); err != nil {
+				if err := s.commitDerived(ctx, state.DerivedState{LibraryID: libraryID, BookID: bookID, Format: plan.Format, GrimmoryFileID: verifiedFile.ID, SourceSHA256: canonicalSHA, OutputSHA256: outputSHA, GenerationFingerprint: plan.GenerationFingerprint, TrustedMTime: verifiedFile.MTime, HasMTime: verifiedFile.TrustedMTime, GeneratedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}); err != nil {
 					conversionErr = fmt.Errorf("%w: %v", ErrState, err)
 				} else {
-					item.Status = "uploaded"
-					if intent.ReplacementTag != "" {
-						pendingCleanupTag = intent.ReplacementTag
-						savedBook.ReplacementInProgressTag = intent.ReplacementTag
-						replacementAuthorizedState = true
-					}
-					if destructiveOperation || (isReplacementOwner && savedBook.ReplacementInProgress) {
-						savedBook.ReplacementInProgress = false
-						replacementAuthorizedState = pendingCleanupTag != ""
-						phaseCleared = true
+					if item.Status != "adopted" {
+						item.Status = "uploaded"
 					}
 					expectedBook = verifiedBook
+					savedDerived[plan.Format] = state.DerivedState{LibraryID: libraryID, BookID: bookID, Format: plan.Format, GrimmoryFileID: verifiedFile.ID, SourceSHA256: canonicalSHA, OutputSHA256: outputSHA, GenerationFingerprint: plan.GenerationFingerprint, TrustedMTime: verifiedFile.MTime, HasMTime: verifiedFile.TrustedMTime, GeneratedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 				}
 			}
-		}
-		if operationCancel != nil {
-			if completionCancel != nil {
-				completionCancel()
-			}
-			completionCtx, completionCancel = operationCtx, operationCancel
 		}
 		if withinWorkspace(workspace, outputPath) {
 			_ = os.Remove(outputPath)
 		}
 		if conversionErr != nil {
 			failed = true
-			if uploadAttempted {
+			if mutationAttempted {
 				stopFurther = true
 			}
 			if errors.Is(conversionErr, ErrSafeReplacementUnavailable) {
@@ -801,11 +736,7 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 		}
 		return result, newPartialError(firstFailure)
 	}
-	finalCtx := ctx
-	if completionCancel != nil {
-		finalCtx = completionCtx
-	}
-	completionBook, completionErr := s.client.GetLibraryBook(finalCtx, libraryID, bookID)
+	completionBook, completionErr := s.client.GetLibraryBook(ctx, libraryID, bookID)
 	if completionErr != nil {
 		result.Status, result.Error = "partial", codeForError(completionErr, "verification_failed")
 		return result, newPartialError(completionErr)
@@ -814,33 +745,14 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 		result.Status, result.Error = "partial", SafeReplacementUnavailableCode
 		return result, newPartialError(ErrSafeReplacementUnavailable)
 	}
-	if pendingCleanupTag != "" {
-		if err := s.markPendingReplacementCleanup(finalCtx, libraryID, bookID, pendingCleanupTag); err != nil {
-			result.Status, result.Error = "partial", "state_write_failed"
-			return result, fmt.Errorf("%w: %v", ErrState, err)
-		}
-		if err := s.clearReplacementTag(finalCtx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, completionBook, pendingCleanupTag); err != nil {
-			result.Status, result.Error = "partial", "replacement_tag_failed"
-			return result, fmt.Errorf("%w: %v", ErrReplacementTagMutation, err)
-		}
-		canonicalState.PendingReplacementTag = pendingCleanupTag
-		canonicalState.ReplacementInProgressTag = ""
-	}
-	canonicalState.ReplacementInProgress = false
 	canonicalState.LastSuccessfulSync = time.Now().UTC()
 	canonicalState.UpdatedAt = time.Now().UTC()
-	if err := s.store.SetBook(finalCtx, canonicalState); err != nil {
+	if err := s.store.SetBook(ctx, canonicalState); err != nil {
 		result.Status, result.Error = "partial", "state_write_failed"
 		return result, fmt.Errorf("%w: %v", ErrState, err)
 	}
-	if pendingCleanupTag != "" {
-		if err := s.clearPendingReplacementTag(finalCtx, libraryID, bookID, pendingCleanupTag); err != nil {
-			result.Status, result.Error = "partial", "state_write_failed"
-			return result, fmt.Errorf("%w: %v", ErrState, err)
-		}
-	}
 	result.Status = "completed"
-	if err := s.SetFailureTag(finalCtx, libraryID, bookID, false); err != nil {
+	if err := s.SetFailureTag(ctx, libraryID, bookID, false); err != nil {
 		result.Status, result.Error = "partial", "failure_tag_failed"
 		return result, fmt.Errorf("%w: %v", ErrFailureTagMutation, err)
 	}
@@ -854,7 +766,8 @@ func (s *Service) createMissingMain(ctx context.Context, libraryID, bookID strin
 		return result, err
 	}
 	defer os.RemoveAll(workspace)
-	sourcePath, sourceSHA, err := s.download(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, source.Format, workspace, "source")
+	reference := grimmory.BookReference{LibraryID: libraryID, BookID: bookID}
+	sourcePath, sourceSHA, err := s.download(ctx, reference, source.Format, workspace, "source")
 	if err != nil {
 		result.Main.Status, result.Main.Error, result.Error = "failed", "download_source_failed", "download_source_failed"
 		return result, err
@@ -862,6 +775,10 @@ func (s *Service) createMissingMain(ctx context.Context, libraryID, bookID strin
 	if source.SHA256 != "" && !strings.EqualFold(source.SHA256, sourceSHA) {
 		result.Main.Status, result.Main.Error, result.Error = "failed", "source_hash_mismatch", "source_hash_mismatch"
 		return result, ErrVerification
+	}
+	if err := s.revalidateMissingMainInventory(ctx, reference, policy.MainFormat, source, sourceSHA, sourcePath, workspace); err != nil {
+		result.Main.Status, result.Main.Error, result.Error = "blocked", SafeReplacementUnavailableCode, SafeReplacementUnavailableCode
+		return result, err
 	}
 	mainPath, err := s.convert(ctx, sourcePath, source.Format, policy.MainFormat, workspace)
 	if err != nil {
@@ -873,7 +790,11 @@ func (s *Service) createMissingMain(ctx context.Context, libraryID, bookID strin
 		result.Main.Status, result.Main.Error, result.Error = "failed", "main_hash_failed", "main_hash_failed"
 		return result, err
 	}
-	if err := s.upload(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, policy.MainFormat, mainPath, source.Name); err != nil {
+	if err := s.revalidateMissingMainInventory(ctx, reference, policy.MainFormat, source, sourceSHA, sourcePath, workspace); err != nil {
+		result.Main.Status, result.Main.Error, result.Error = "blocked", SafeReplacementUnavailableCode, SafeReplacementUnavailableCode
+		return result, err
+	}
+	if err := s.upload(ctx, reference, policy.MainFormat, mainPath, source.Name); err != nil {
 		result.Main.Status, result.Main.Error, result.Error = "failed", "main_upload_failed", "main_upload_failed"
 		return result, err
 	}
@@ -887,310 +808,72 @@ func (s *Service) createMissingMain(ctx context.Context, libraryID, bookID strin
 		result.Main.Status, result.Main.Error, result.Error = "failed", "verification_failed", "verification_failed"
 		return result, ErrVerification
 	}
-	if err := s.verifyUploadedFile(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, grimmory.File{}, false, verifiedMain, mainSHA, workspace, verifiedBook.Files, ""); err != nil {
+	if err := s.verifyUploadedFile(ctx, reference, grimmory.File{}, false, verifiedMain, mainSHA, workspace, verifiedBook.Files, ""); err != nil {
 		result.Main.Status, result.Main.Error, result.Error = "failed", "verification_failed", "verification_failed"
 		return result, err
 	}
-	verifiedMainSHA := mainSHA
 	canonicalName := verifiedMain.Name
 	if canonicalName == "" {
 		canonicalName = desiredOutputName(source.Name, policy.MainFormat)
 	}
-	canonicalState := state.BookState{LibraryID: libraryID, BookID: bookID, MainFormat: policy.MainFormat, CanonicalFormat: policy.MainFormat, CanonicalFileID: verifiedMain.ID, CanonicalFileName: canonicalName, CanonicalSHA256: verifiedMainSHA, MetadataFingerprint: verifiedMain.MetadataFingerprint, CanonicalMTime: verifiedMain.MTime, TrustedMTime: verifiedMain.TrustedMTime, LastSuccessfulSync: savedBook.LastSuccessfulSync, PendingReplacementTag: savedBook.PendingReplacementTag, ReplacementInProgressTag: savedBook.ReplacementInProgressTag, ReplacementInProgress: savedBook.ReplacementInProgress, UpdatedAt: time.Now().UTC()}
+	canonicalState := state.BookState{LibraryID: libraryID, BookID: bookID, MainFormat: policy.MainFormat, CanonicalFormat: policy.MainFormat, CanonicalFileID: verifiedMain.ID, CanonicalFileName: canonicalName, CanonicalSHA256: mainSHA, MetadataFingerprint: verifiedMain.MetadataFingerprint, CanonicalMTime: verifiedMain.MTime, TrustedMTime: verifiedMain.TrustedMTime, LastSuccessfulSync: savedBook.LastSuccessfulSync, UpdatedAt: time.Now().UTC()}
 	if err := s.store.SetBook(ctx, canonicalState); err != nil {
 		result.Main.Status, result.Main.Error, result.Error = "failed", "state_write_failed", "state_write_failed"
 		return result, fmt.Errorf("%w: %v", ErrState, err)
 	}
 	result.Main.Status, result.Main.Action, result.Main.Reason = "created", "created", "main_missing"
-	replacementAllowed := s.replacementAllowedForState(verifiedBook, savedBook, options)
-	replacementTagRequested := (s.replacementTag != "" && hasTag(verifiedBook, s.replacementTag)) || savedBook.ReplacementInProgressTag != ""
-	replacementTag := s.replacementTag
-	if savedBook.ReplacementInProgressTag != "" {
-		replacementTag = savedBook.ReplacementInProgressTag
+	derivativeResult, syncErr := s.Sync(ctx, libraryID, bookID, options)
+	result.Derivatives = derivativeResult.Derivatives
+	result.Status, result.Error = derivativeResult.Status, derivativeResult.Error
+	return result, syncErr
+}
+
+func (s *Service) revalidateMissingMainInventory(ctx context.Context, reference grimmory.BookReference, mainFormat string, source grimmory.File, sourceSHA, sourcePath, workspace string) error {
+	if err := verifyLocalCanonicalUnchanged(sourcePath, sourceSHA, s.maxFileBytes); err != nil {
+		return err
 	}
-	uploadIntents, err := s.getUploadIntents(ctx, libraryID, bookID)
+	current, err := s.client.GetLibraryBook(ctx, reference.LibraryID, reference.BookID)
 	if err != nil {
-		result.Status, result.Error = "partial", "state_read_failed"
-		return result, fmt.Errorf("%w: %v", ErrState, err)
+		return err
 	}
-	if savedBook.ReplacementInProgress && len(uploadIntents) == 0 {
-		result.Status, result.Error = "partial", SafeReplacementUnavailableCode
-		return result, newPartialError(ErrSafeReplacementUnavailable)
+	if hasTag(current, s.ignoreTag) {
+		return fmt.Errorf("%w: ignore authorization appeared before main creation", ErrSafeReplacementUnavailable)
 	}
-	generationFingerprints := DesiredGenerationFingerprints(verifiedBook, verifiedMainSHA, canonicalName, policy.OutputFormats)
-	plans := PlanDerivatives(verifiedBook.Files, policy.OutputFormats, policy.MainFormat, verifiedMainSHA, nil, verifiedMain.MTime, verifiedMain.TrustedMTime, true, options.Force, false, generationFingerprints, canonicalName)
-	plans, replacementOwner, ownerReady := prioritizeReplacementOwner(savedBook, uploadIntents, plans)
-	if savedBook.ReplacementInProgress && !ownerReady {
-		result.Status, result.Error = "partial", SafeReplacementUnavailableCode
-		return result, newPartialError(ErrSafeReplacementUnavailable)
+	if current.ID != reference.BookID || current.LibraryID != reference.LibraryID || !uniqueFileIDs(current.Files) {
+		return fmt.Errorf("%w: main creation inventory identity changed", ErrSafeReplacementUnavailable)
 	}
-	failed := false
-	blocked := false
-	stopFurther := false
-	var firstFailure error
-	pendingCleanupTag := savedBook.ReplacementInProgressTag
-	replacementAuthorizedState := savedBook.ReplacementInProgress || pendingCleanupTag != ""
-	phaseCleared := false
-	completionCtx := ctx
-	var completionCancel context.CancelFunc
-	defer func() {
-		if completionCancel != nil {
-			completionCancel()
-		}
-	}()
-	expectedBook := verifiedBook
-	for _, plan := range plans {
-		if stopFurther {
-			break
-		}
-		if phaseCleared {
-			if s.ignoreTag != "" {
-				refreshedBook, ignored, refreshErr := s.refreshBookBeforeNextDerivative(ctx, libraryID, bookID)
-				if refreshErr != nil {
-					result.Status, result.Error = "partial", codeForError(refreshErr, "verification_failed")
-					return result, newPartialError(refreshErr)
-				}
-				expectedBook = refreshedBook
-				if ignored {
-					result.Status = "ignored"
-					return result, nil
-				}
-			}
-			phaseCleared = false
-		}
-		replacementAllowed = s.replacementAllowedForState(expectedBook, savedBook, options)
-		replacementTagRequested = (s.replacementTag != "" && hasTag(expectedBook, s.replacementTag)) || savedBook.ReplacementInProgressTag != ""
-		replacementTag = s.replacementTag
-		if savedBook.ReplacementInProgressTag != "" {
-			replacementTag = savedBook.ReplacementInProgressTag
-		}
-		isReplacementOwner := replacementOwner != "" && normalizeFormat(plan.Format) == replacementOwner
-		if savedBook.ReplacementInProgress && replacementOwner != "" && !isReplacementOwner {
-			stopFurther = true
-			break
-		}
-		item := ItemResult{Format: plan.Format, SourceFormat: policy.MainFormat, Action: plan.Action, Reason: plan.Reason, Status: "failed"}
-		before, hadBefore := FindFile(expectedBook.Files, plan.Format)
-		intent, hasIntent := uploadIntents[plan.Format]
-		if isReplacementOwner && savedBook.ReplacementInProgress && hasIntent && plan.Action == "unchanged" {
-			plan.Action, plan.Reason, plan.Blocked = "rebuild", "replacement_in_progress", true
-			item.Action, item.Reason = plan.Action, plan.Reason
-		}
-		resumeDestructive := isReplacementOwner && savedBook.ReplacementInProgress && hasIntent && replacementTargetMatches(expectedBook.Files, plan.Format, intent)
-		safeMissingRecovery := isReplacementOwner && savedBook.ReplacementInProgress && hasIntent && replacementTargetMissing(expectedBook.Files, plan.Format, intent)
-		if isReplacementOwner && savedBook.ReplacementInProgress && !hasIntent {
-			failed = true
-			blocked = true
-			stopFurther = true
-			firstFailure = ErrSafeReplacementUnavailable
-			item.Status, item.Error = "blocked", SafeReplacementUnavailableCode
-			result.Derivatives = append(result.Derivatives, item)
-			continue
-		}
-		needsIntentRecovery := hasIntent && !resumeDestructive && !safeMissingRecovery && ((isReplacementOwner && savedBook.ReplacementInProgress) || (plan.Blocked && !options.Force) || plan.Action == "create")
-		if needsIntentRecovery {
-			if hasIntent {
-				candidate, recoveredBook, recoverable, recoveryErr := s.recoverableIntentCandidate(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, workspace, expectedBook, verifiedMain, plan, intent, verifiedMainSHA, canonicalName, policy.MainFormat)
-				if recoveryErr != nil {
-					failed = true
-					stopFurther = true
-					if firstFailure == nil {
-						firstFailure = recoveryErr
-					}
-					item.Status, item.Error = "failed", codeForError(recoveryErr, "derivative_failed")
-					result.Derivatives = append(result.Derivatives, item)
-					continue
-				}
-				if recoverable {
-					if err := s.commitDerived(ctx, adoptedDerivedState(libraryID, bookID, plan, candidate, intent), intent.ReplacementTag); err != nil {
-						stateErr := fmt.Errorf("%w: %v", ErrState, err)
-						failed = true
-						stopFurther = true
-						if firstFailure == nil {
-							firstFailure = stateErr
-						}
-						item.Status, item.Error = "failed", codeForError(stateErr, "state_write_failed")
-						result.Derivatives = append(result.Derivatives, item)
-						continue
-					}
-					item.Status, item.Reason = "adopted", "upload_intent_recovered"
-					if intent.ReplacementTag != "" {
-						pendingCleanupTag = intent.ReplacementTag
-						savedBook.ReplacementInProgressTag = intent.ReplacementTag
-					}
-					if isReplacementOwner && savedBook.ReplacementInProgress {
-						savedBook.ReplacementInProgress = false
-						replacementAuthorizedState = pendingCleanupTag != ""
-						phaseCleared = true
-					}
-					expectedBook = recoveredBook
-					result.Derivatives = append(result.Derivatives, item)
-					continue
-				}
-				if isReplacementOwner && savedBook.ReplacementInProgress {
-					failed = true
-					blocked = true
-					stopFurther = true
-					firstFailure = ErrSafeReplacementUnavailable
-					item.Status, item.Error = "blocked", SafeReplacementUnavailableCode
-					result.Derivatives = append(result.Derivatives, item)
-					continue
-				}
-				if plan.Blocked && !options.Force && len(filesForFormat(expectedBook.Files, plan.Format)) > 0 {
-					failed = true
-					blocked = true
-					stopFurther = true
-					firstFailure = ErrSafeReplacementUnavailable
-					item.Status, item.Error = "blocked", SafeReplacementUnavailableCode
-					result.Derivatives = append(result.Derivatives, item)
-					continue
-				}
-			}
-		}
-		if plan.Blocked && !replacementAllowed {
-			item.Status = "blocked"
-			item.Error = SafeReplacementUnavailableCode
-			failed = true
-			blocked = true
-			if firstFailure == nil {
-				firstFailure = ErrSafeReplacementUnavailable
-			}
-			result.Derivatives = append(result.Derivatives, item)
-			continue
-		}
-		tagAuthorized := replacementTagRequested && !options.Force && s.existingPolicy != "replace" && plan.Blocked && hadBefore
-		intent = uploadIntentFor(libraryID, bookID, plan, canonicalName, verifiedMainSHA, verifiedMain, stableInventoryFingerprint(expectedBook.Files, plan.Format), tagAuthorized, replacementTag)
-		if safeMissingRecovery {
-			intent = preservePreparedReplacementEvidence(uploadIntents[plan.Format], intent)
-		}
-		outputPath, conversionErr := s.convert(ctx, mainPath, policy.MainFormat, plan.Format, workspace)
-		var outputSHA string
-		if conversionErr == nil {
-			if !withinWorkspace(workspace, outputPath) {
-				conversionErr = errors.New("converter output escaped workspace")
-			} else {
-				outputSHA, _, conversionErr = convert.HashFile(outputPath, s.maxFileBytes)
-			}
-		}
-		if conversionErr == nil {
-			intent.OutputSHA256 = outputSHA
-		}
-		operationCtx := ctx
-		var operationCancel context.CancelFunc
-		uploadAttempted := false
-		destructiveOperation := false
-		if conversionErr == nil {
-			uploadAttempted = true
-			destructiveOperation, operationCtx, operationCancel, conversionErr = s.uploadDerivative(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, plan, before, hadBefore, expectedBook, policy.MainFormat, verifiedMain, verifiedMainSHA, workspace, outputPath, canonicalName, options, intent, replacementAuthorizedState)
-			if destructiveOperation {
-				savedBook.ReplacementInProgress = true
-			}
-		}
-		if conversionErr == nil {
-			verified, verifyErr := s.client.GetLibraryBook(operationCtx, libraryID, bookID)
-			if verifyErr != nil {
-				conversionErr = verifyErr
-			} else if verifiedFile, exists := findUploadedFile(verified.Files, plan.Format, desiredOutputName(canonicalName, plan.Format)); !exists {
-				conversionErr = ErrVerification
-			} else if conversionErr = s.verifyUploadedFile(operationCtx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, before, hadBefore, verifiedFile, outputSHA, workspace, verified.Files, verifiedMain.ID); conversionErr != nil {
-			} else if conversionErr = s.revalidateCanonicalSource(operationCtx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, policy.MainFormat, verifiedMain, verifiedMainSHA, mainPath, workspace, plan.Format, verified); conversionErr != nil {
-			} else {
-				if stateErr := s.commitDerived(operationCtx, state.DerivedState{LibraryID: libraryID, BookID: bookID, Format: plan.Format, GrimmoryFileID: verifiedFile.ID, SourceSHA256: verifiedMainSHA, OutputSHA256: outputSHA, GenerationFingerprint: plan.GenerationFingerprint, TrustedMTime: verifiedFile.MTime, HasMTime: verifiedFile.TrustedMTime, GeneratedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}, intent.ReplacementTag); stateErr != nil {
-					conversionErr = fmt.Errorf("%w: %v", ErrState, stateErr)
-				} else {
-					item.Status = "uploaded"
-					if intent.ReplacementTag != "" {
-						pendingCleanupTag = intent.ReplacementTag
-						savedBook.ReplacementInProgressTag = intent.ReplacementTag
-						replacementAuthorizedState = true
-					}
-					if destructiveOperation || (isReplacementOwner && savedBook.ReplacementInProgress) {
-						savedBook.ReplacementInProgress = false
-						replacementAuthorizedState = pendingCleanupTag != ""
-						phaseCleared = true
-					}
-					expectedBook = verified
-				}
-			}
-		}
-		if operationCancel != nil {
-			if completionCancel != nil {
-				completionCancel()
-			}
-			completionCtx, completionCancel = operationCtx, operationCancel
-		}
-		if withinWorkspace(workspace, outputPath) {
-			_ = os.Remove(outputPath)
-		}
-		if conversionErr != nil {
-			failed = true
-			if uploadAttempted {
-				stopFurther = true
-			}
-			if errors.Is(conversionErr, ErrSafeReplacementUnavailable) {
-				blocked = true
-			}
-			if firstFailure == nil {
-				firstFailure = conversionErr
-			}
-			item.Error = codeForError(conversionErr, "derivative_failed")
-		}
-		result.Derivatives = append(result.Derivatives, item)
+	if len(filesForFormat(current.Files, mainFormat)) != 0 {
+		return fmt.Errorf("%w: main target appeared before creation", ErrSafeReplacementUnavailable)
 	}
-	if failed {
-		result.Status = "partial"
-		if blocked {
-			result.Error = SafeReplacementUnavailableCode
-			firstFailure = ErrSafeReplacementUnavailable
-		} else {
-			result.Error = "derivative_failed"
-		}
-		return result, newPartialError(firstFailure)
+	sources := filesForFormat(current.Files, source.Format)
+	if len(sources) != 1 || !sameFileIdentity(sources[0], source) {
+		return fmt.Errorf("%w: main source changed before creation", ErrSafeReplacementUnavailable)
 	}
-	finalCtx := ctx
-	if completionCancel != nil {
-		finalCtx = completionCtx
+	checkPath, checkSHA, err := s.download(ctx, reference, source.Format, workspace, "revalidate-main-source")
+	if checkPath != "" {
+		defer os.Remove(checkPath)
 	}
-	completionBook, completionErr := s.client.GetLibraryBook(finalCtx, libraryID, bookID)
-	if completionErr != nil {
-		result.Status, result.Error = "partial", codeForError(completionErr, "verification_failed")
-		return result, newPartialError(completionErr)
+	if err != nil {
+		return err
 	}
-	if !sameFileInventory(completionBook, expectedBook) {
-		result.Status, result.Error = "partial", SafeReplacementUnavailableCode
-		return result, newPartialError(ErrSafeReplacementUnavailable)
+	if !strings.EqualFold(checkSHA, sourceSHA) {
+		return fmt.Errorf("%w: main source content changed before creation", ErrSafeReplacementUnavailable)
 	}
-	if pendingCleanupTag != "" {
-		if err := s.markPendingReplacementCleanup(finalCtx, libraryID, bookID, pendingCleanupTag); err != nil {
-			result.Status, result.Error = "partial", "state_write_failed"
-			return result, fmt.Errorf("%w: %v", ErrState, err)
-		}
-		if err := s.clearReplacementTag(finalCtx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, completionBook, pendingCleanupTag); err != nil {
-			result.Status, result.Error = "partial", "replacement_tag_failed"
-			return result, fmt.Errorf("%w: %v", ErrReplacementTagMutation, err)
-		}
-		canonicalState.PendingReplacementTag = pendingCleanupTag
-		canonicalState.ReplacementInProgressTag = ""
+	latest, err := s.client.GetLibraryBook(ctx, reference.LibraryID, reference.BookID)
+	if err != nil {
+		return err
 	}
-	canonicalState.ReplacementInProgress = false
-	canonicalState.LastSuccessfulSync = time.Now().UTC()
-	canonicalState.UpdatedAt = time.Now().UTC()
-	if err := s.store.SetBook(finalCtx, canonicalState); err != nil {
-		result.Status, result.Error = "partial", "state_write_failed"
-		return result, fmt.Errorf("%w: %v", ErrState, err)
+	if hasTag(latest, s.ignoreTag) || !sameFileInventory(latest, current) {
+		return fmt.Errorf("%w: main creation inventory changed during source verification", ErrSafeReplacementUnavailable)
 	}
-	if pendingCleanupTag != "" {
-		if err := s.clearPendingReplacementTag(finalCtx, libraryID, bookID, pendingCleanupTag); err != nil {
-			result.Status, result.Error = "partial", "state_write_failed"
-			return result, fmt.Errorf("%w: %v", ErrState, err)
-		}
+	if len(filesForFormat(latest.Files, mainFormat)) != 0 {
+		return fmt.Errorf("%w: main target appeared before creation", ErrSafeReplacementUnavailable)
 	}
-	result.Status = "completed"
-	if err := s.SetFailureTag(finalCtx, libraryID, bookID, false); err != nil {
-		result.Status, result.Error = "partial", "failure_tag_failed"
-		return result, fmt.Errorf("%w: %v", ErrFailureTagMutation, err)
+	latestSources := filesForFormat(latest.Files, source.Format)
+	if len(latestSources) != 1 || !sameFileIdentity(latestSources[0], source) {
+		return fmt.Errorf("%w: main source changed before creation", ErrSafeReplacementUnavailable)
 	}
-	return result, nil
+	return nil
 }
 
 // SetFailureTag is the sole service entry point for the operational failure
@@ -1232,96 +915,6 @@ func (s *Service) replacementAllowed(book grimmory.Book, options SyncOptions) bo
 	return s.existingPolicy == "replace" || (s.replacementTag != "" && hasTag(book, s.replacementTag)) || options.Force
 }
 
-func (s *Service) replacementAllowedForState(book grimmory.Book, savedBook state.BookState, options SyncOptions) bool {
-	if savedBook.ReplacementInProgress || savedBook.ReplacementInProgressTag != "" {
-		return true
-	}
-	return s.replacementAllowed(book, options)
-}
-
-func (s *Service) replacementAllowedForFormat(book grimmory.Book, savedBook state.BookState, ownerFormat, format string, options SyncOptions) bool {
-	if savedBook.ReplacementInProgress && ownerFormat != "" && normalizeFormat(format) != ownerFormat {
-		savedBook.ReplacementInProgress = false
-	}
-	return s.replacementAllowedForState(book, savedBook, options)
-}
-
-func replacementTargetMatches(files []grimmory.File, format string, intent state.DerivedUploadIntent) bool {
-	if intent.ReplacementTargetID == "" || normalizeFormat(intent.ReplacementTargetFormat) != normalizeFormat(format) {
-		return false
-	}
-	targets := filesForFormat(files, format)
-	if len(targets) != 1 || !uniqueFileIDs(files) {
-		return false
-	}
-	return sameFileIdentity(targets[0], grimmory.File{
-		ID: intent.ReplacementTargetID, Name: intent.ReplacementTargetName,
-		Format: intent.ReplacementTargetFormat, Type: intent.ReplacementTargetType,
-	})
-}
-
-func replacementTargetMissing(files []grimmory.File, format string, intent state.DerivedUploadIntent) bool {
-	return intent.ReplacementTargetID != "" && normalizeFormat(intent.ReplacementTargetFormat) == normalizeFormat(format) && uniqueFileIDs(files) && len(filesForFormat(files, format)) == 0
-}
-
-func replacementOwnerFormat(savedBook state.BookState, intents map[string]state.DerivedUploadIntent) (string, bool) {
-	if !savedBook.ReplacementInProgress {
-		return "", true
-	}
-	formats := make([]string, 0, len(intents))
-	for format := range intents {
-		formats = append(formats, format)
-	}
-	sort.Strings(formats)
-	prepared := make([]string, 0, len(formats))
-	for _, format := range formats {
-		intent := intents[format]
-		candidate := normalizeFormat(intent.ReplacementTargetFormat)
-		if intent.ReplacementTargetID == "" || candidate == "" || candidate != normalizeFormat(format) {
-			continue
-		}
-		prepared = append(prepared, candidate)
-	}
-	if len(prepared) == 1 {
-		return prepared[0], true
-	}
-	if len(prepared) > 1 {
-		return "", false
-	}
-	if len(formats) == 1 {
-		return normalizeFormat(formats[0]), true
-	}
-	return "", false
-}
-
-func prioritizeReplacementOwner(savedBook state.BookState, intents map[string]state.DerivedUploadIntent, plans []DerivativePlan) ([]DerivativePlan, string, bool) {
-	owner, ok := replacementOwnerFormat(savedBook, intents)
-	if !ok {
-		return plans, "", false
-	}
-	if !savedBook.ReplacementInProgress {
-		return plans, "", true
-	}
-	ownerIndex := -1
-	for index, plan := range plans {
-		if normalizeFormat(plan.Format) == owner {
-			ownerIndex = index
-			break
-		}
-	}
-	if ownerIndex < 0 {
-		return plans, owner, false
-	}
-	if ownerIndex == 0 {
-		return plans, owner, true
-	}
-	ordered := make([]DerivativePlan, 0, len(plans))
-	ordered = append(ordered, plans[ownerIndex])
-	ordered = append(ordered, plans[:ownerIndex]...)
-	ordered = append(ordered, plans[ownerIndex+1:]...)
-	return ordered, owner, true
-}
-
 func hasTag(book grimmory.Book, wanted string) bool {
 	if wanted == "" {
 		return false
@@ -1345,136 +938,16 @@ func (s *Service) refreshBookBeforeNextDerivative(ctx context.Context, libraryID
 	return book, hasTag(book, s.ignoreTag), nil
 }
 
-func (s *Service) getUploadIntents(ctx context.Context, libraryID, bookID string) (map[string]state.DerivedUploadIntent, error) {
-	store, ok := s.store.(UploadIntentStore)
-	if !ok {
-		return map[string]state.DerivedUploadIntent{}, nil
-	}
-	return store.GetDerivedUploadIntents(ctx, libraryID, bookID)
+func (s *Service) getUploadReceipts(ctx context.Context, libraryID, bookID string) (map[string]state.DerivedUploadReceipt, error) {
+	return s.store.GetDerivedUploadReceipts(ctx, libraryID, bookID)
 }
 
-func (s *Service) setUploadIntent(ctx context.Context, value state.DerivedUploadIntent) error {
-	store, ok := s.store.(UploadIntentStore)
-	if !ok {
-		return nil
-	}
-	return store.SetDerivedUploadIntent(ctx, value)
+func (s *Service) setUploadReceipt(ctx context.Context, value state.DerivedUploadReceipt) error {
+	return s.store.SetDerivedUploadReceipt(ctx, value)
 }
 
-func (s *Service) commitDerived(ctx context.Context, value state.DerivedState, pendingTag string) error {
-	if store, ok := s.store.(DerivedCommitStore); ok {
-		return store.CommitDerived(ctx, value, pendingTag)
-	}
-	if err := s.store.SetDerived(ctx, value); err != nil {
-		return err
-	}
-	book, _, err := s.store.Get(ctx, value.LibraryID, value.BookID)
-	if err != nil {
-		return err
-	}
-	if pendingTag != "" {
-		book.ReplacementInProgressTag = pendingTag
-	}
-	book.ReplacementInProgress = false
-	book.UpdatedAt = time.Now().UTC()
-	return s.store.SetBook(ctx, book)
-}
-
-func (s *Service) markReplacementInProgress(ctx context.Context, libraryID, bookID, tag string) error {
-	if store, ok := s.store.(ReplacementProgressStore); ok {
-		return store.MarkReplacementInProgress(ctx, libraryID, bookID, tag)
-	}
-	book, _, err := s.store.Get(ctx, libraryID, bookID)
-	if err != nil {
-		return err
-	}
-	book.ReplacementInProgress = true
-	if tag != "" {
-		book.ReplacementInProgressTag = tag
-	}
-	book.UpdatedAt = time.Now().UTC()
-	return s.store.SetBook(ctx, book)
-}
-
-func (s *Service) prepareReplacement(ctx context.Context, intent state.DerivedUploadIntent) error {
-	if store, ok := s.store.(ReplacementPreparationStore); ok {
-		return store.PrepareReplacement(ctx, intent)
-	}
-	if _, ok := s.store.(UploadIntentStore); !ok {
-		return errors.New("durable replacement intent is unsupported")
-	}
-	if err := s.setUploadIntent(ctx, intent); err != nil {
-		return err
-	}
-	return s.markReplacementInProgress(ctx, intent.LibraryID, intent.BookID, intent.ReplacementTag)
-}
-
-func (s *Service) markPendingReplacementCleanup(ctx context.Context, libraryID, bookID, tag string) error {
-	if store, ok := s.store.(PendingReplacementMarkerStore); ok {
-		return store.MarkPendingReplacementCleanup(ctx, libraryID, bookID, tag)
-	}
-	book, _, err := s.store.Get(ctx, libraryID, bookID)
-	if err != nil {
-		return err
-	}
-	if book.PendingReplacementTag != tag && book.ReplacementInProgressTag != tag {
-		return errors.New("replacement authorization is not in progress")
-	}
-	book.PendingReplacementTag = tag
-	book.ReplacementInProgressTag = ""
-	book.ReplacementInProgress = false
-	book.UpdatedAt = time.Now().UTC()
-	return s.store.SetBook(ctx, book)
-}
-
-func (s *Service) clearPendingReplacementTag(ctx context.Context, libraryID, bookID, tag string) error {
-	if store, ok := s.store.(PendingReplacementStore); ok {
-		return store.ClearPendingReplacementTag(ctx, libraryID, bookID, tag)
-	}
-	book, _, err := s.store.Get(ctx, libraryID, bookID)
-	if err != nil {
-		return err
-	}
-	if book.PendingReplacementTag == "" || book.PendingReplacementTag != tag {
-		return nil
-	}
-	book.PendingReplacementTag = ""
-	book.UpdatedAt = time.Now().UTC()
-	return s.store.SetBook(ctx, book)
-}
-
-func (s *Service) finishPendingReplacementCleanup(ctx context.Context, libraryID, bookID string, book grimmory.Book, savedBook state.BookState, result Result) (Result, error) {
-	reference := grimmory.BookReference{LibraryID: libraryID, BookID: bookID}
-	if err := s.clearReplacementTag(ctx, reference, book, savedBook.PendingReplacementTag); err != nil {
-		result.Status, result.Error = "partial", "replacement_tag_failed"
-		return result, fmt.Errorf("%w: %v", ErrReplacementTagMutation, err)
-	}
-	savedBook.ReplacementInProgressTag = ""
-	savedBook.ReplacementInProgress = false
-	savedBook.LastSuccessfulSync = time.Now().UTC()
-	savedBook.UpdatedAt = time.Now().UTC()
-	if err := s.store.SetBook(ctx, savedBook); err != nil {
-		result.Status, result.Error = "partial", "state_write_failed"
-		return result, fmt.Errorf("%w: %v", ErrState, err)
-	}
-	if err := s.clearPendingReplacementTag(ctx, libraryID, bookID, savedBook.PendingReplacementTag); err != nil {
-		result.Status, result.Error = "partial", "state_write_failed"
-		return result, fmt.Errorf("%w: %v", ErrState, err)
-	}
-	if err := s.SetFailureTag(ctx, libraryID, bookID, false); err != nil {
-		result.Status, result.Error = "partial", "failure_tag_failed"
-		return result, fmt.Errorf("%w: %v", ErrFailureTagMutation, err)
-	}
-	result.Status = "completed"
-	return result, nil
-}
-
-func (s *Service) replacementCompletionContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	timeout := 2 * time.Minute
-	if s.conversionTimeout > 0 && s.conversionTimeout < timeout {
-		timeout = s.conversionTimeout
-	}
-	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
+func (s *Service) commitDerived(ctx context.Context, value state.DerivedState) error {
+	return s.store.CommitDerived(ctx, value)
 }
 
 func verifyLocalOutputUnchanged(filePath, expectedSHA string, maxBytes int64) error {
@@ -1491,67 +964,33 @@ func verifyLocalOutputUnchanged(filePath, expectedSHA string, maxBytes int64) er
 	return nil
 }
 
-func uploadIntentFor(libraryID, bookID string, plan DerivativePlan, canonicalName, canonicalSHA string, canonical grimmory.File, stableInventory string, tagAuthorized bool, replacementTag string) state.DerivedUploadIntent {
-	intent := state.DerivedUploadIntent{
+func uploadReceiptFor(libraryID, bookID string, plan DerivativePlan, canonicalName, canonicalSHA string) state.DerivedUploadReceipt {
+	return state.DerivedUploadReceipt{
 		LibraryID: libraryID, BookID: bookID, Format: plan.Format,
 		OutputName: desiredOutputName(canonicalName, plan.Format), OutputSHA256: "pending",
 		SourceSHA256: canonicalSHA, GenerationFingerprint: plan.GenerationFingerprint,
-		SourceFileID: canonical.ID, SourceFileName: canonical.Name, SourceFormat: canonical.Format,
-		StableInventoryFingerprint: stableInventory, UpdatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
 	}
-	if tagAuthorized {
-		intent.ReplacementTag = replacementTag
-	}
-	return intent
 }
 
-func preservePreparedReplacementEvidence(prepared, regenerated state.DerivedUploadIntent) state.DerivedUploadIntent {
-	regenerated.ReplacementTag = prepared.ReplacementTag
-	regenerated.ReplacementTargetID = prepared.ReplacementTargetID
-	regenerated.ReplacementTargetName = prepared.ReplacementTargetName
-	regenerated.ReplacementTargetFormat = prepared.ReplacementTargetFormat
-	regenerated.ReplacementTargetType = prepared.ReplacementTargetType
-	return regenerated
-}
-
-func adoptedDerivedState(libraryID, bookID string, plan DerivativePlan, candidate grimmory.File, intent state.DerivedUploadIntent) state.DerivedState {
+func adoptedDerivedState(libraryID, bookID string, plan DerivativePlan, candidate grimmory.File, receipt state.DerivedUploadReceipt) state.DerivedState {
 	return state.DerivedState{
 		LibraryID: libraryID, BookID: bookID, Format: plan.Format,
-		GrimmoryFileID: candidate.ID, SourceSHA256: intent.SourceSHA256,
-		OutputSHA256: intent.OutputSHA256, GenerationFingerprint: intent.GenerationFingerprint,
+		GrimmoryFileID: candidate.ID, SourceSHA256: receipt.SourceSHA256,
+		OutputSHA256: receipt.OutputSHA256, GenerationFingerprint: receipt.GenerationFingerprint,
 		TrustedMTime: candidate.MTime, HasMTime: candidate.TrustedMTime,
 		GeneratedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 }
 
-// recoverableIntentCandidate adopts only a unique candidate whose complete
-// scoped evidence still agrees with the intent. It intentionally performs no
-// remote mutation; an absent, ambiguous, or mismatched candidate is simply
-// left for the normal planner to handle.
-func (s *Service) recoverableIntentCandidate(ctx context.Context, reference grimmory.BookReference, workspace string, initialBook grimmory.Book, canonical grimmory.File, plan DerivativePlan, intent state.DerivedUploadIntent, canonicalSHA, canonicalName, canonicalFormat string) (grimmory.File, grimmory.Book, bool, error) {
+// recoverableReceiptCandidate adopts only one uniquely named candidate whose
+// downloaded bytes match the receipt. It performs no remote mutation.
+func (s *Service) recoverableReceiptCandidate(ctx context.Context, reference grimmory.BookReference, workspace string, canonical grimmory.File, plan DerivativePlan, receipt state.DerivedUploadReceipt, canonicalSHA, canonicalName, canonicalFormat string) (grimmory.File, grimmory.Book, bool, error) {
 	expectedName := desiredOutputName(canonicalName, plan.Format)
-	if normalizeFormat(intent.Format) != normalizeFormat(plan.Format) || !sameNormalizedName(intent.OutputName, expectedName) || intent.OutputSHA256 == "" || intent.SourceSHA256 == "" || intent.GenerationFingerprint == "" {
+	if normalizeFormat(receipt.Format) != normalizeFormat(plan.Format) || !sameNormalizedName(receipt.OutputName, expectedName) || receipt.OutputSHA256 == "" || receipt.SourceSHA256 == "" || receipt.GenerationFingerprint == "" {
 		return grimmory.File{}, grimmory.Book{}, false, nil
 	}
-	if canonicalSHA == "" || !strings.EqualFold(intent.SourceSHA256, canonicalSHA) || intent.GenerationFingerprint != plan.GenerationFingerprint {
-		return grimmory.File{}, grimmory.Book{}, false, nil
-	}
-	if intent.SourceFileID != "" && intent.SourceFileID != canonical.ID {
-		return grimmory.File{}, grimmory.Book{}, false, nil
-	}
-	if intent.SourceFileName != "" && !sameNormalizedName(intent.SourceFileName, canonical.Name) {
-		return grimmory.File{}, grimmory.Book{}, false, nil
-	}
-	if intent.SourceFormat != "" && normalizeFormat(intent.SourceFormat) != normalizeFormat(canonicalFormat) {
-		return grimmory.File{}, grimmory.Book{}, false, nil
-	}
-	expectedStableInventory := intent.StableInventoryFingerprint
-	if expectedStableInventory == "" {
-		// Legacy rows did not persist this evidence. Derive it from the scoped
-		// observation, while still requiring every candidate check below.
-		expectedStableInventory = stableInventoryFingerprint(initialBook.Files, plan.Format)
-	}
-	if expectedStableInventory == "" || stableInventoryFingerprint(initialBook.Files, plan.Format) != expectedStableInventory {
+	if canonicalSHA == "" || !strings.EqualFold(receipt.SourceSHA256, canonicalSHA) || receipt.GenerationFingerprint != plan.GenerationFingerprint {
 		return grimmory.File{}, grimmory.Book{}, false, nil
 	}
 	current, err := s.client.GetLibraryBook(ctx, reference.LibraryID, reference.BookID)
@@ -1565,9 +1004,6 @@ func (s *Service) recoverableIntentCandidate(ctx context.Context, reference grim
 	if len(currentCanonical) != 1 || !sameFileIdentity(currentCanonical[0], canonical) {
 		return grimmory.File{}, grimmory.Book{}, false, nil
 	}
-	if stableInventoryFingerprint(current.Files, plan.Format) != expectedStableInventory {
-		return grimmory.File{}, grimmory.Book{}, false, nil
-	}
 	candidate, ok := uniqueIntentCandidate(current.Files, plan.Format, expectedName, currentCanonical[0].ID)
 	if !ok {
 		return grimmory.File{}, grimmory.Book{}, false, nil
@@ -1579,7 +1015,7 @@ func (s *Service) recoverableIntentCandidate(ctx context.Context, reference grim
 	if err != nil {
 		return grimmory.File{}, grimmory.Book{}, false, err
 	}
-	if !strings.EqualFold(outputSHA, intent.OutputSHA256) {
+	if !strings.EqualFold(outputSHA, receipt.OutputSHA256) {
 		return grimmory.File{}, grimmory.Book{}, false, nil
 	}
 	sourcePath, downloadedSourceSHA, err := s.download(ctx, reference, canonicalFormat, workspace, "adoption-source-"+normalizeFormat(plan.Format))
@@ -1589,7 +1025,7 @@ func (s *Service) recoverableIntentCandidate(ctx context.Context, reference grim
 	if err != nil {
 		return grimmory.File{}, grimmory.Book{}, false, err
 	}
-	if !strings.EqualFold(downloadedSourceSHA, intent.SourceSHA256) {
+	if !strings.EqualFold(downloadedSourceSHA, receipt.SourceSHA256) {
 		return grimmory.File{}, grimmory.Book{}, false, nil
 	}
 	latest, err := s.client.GetLibraryBook(ctx, reference.LibraryID, reference.BookID)
@@ -1603,7 +1039,7 @@ func (s *Service) recoverableIntentCandidate(ctx context.Context, reference grim
 	if len(latestCanonical) != 1 || !sameFileIdentity(latestCanonical[0], canonical) {
 		return grimmory.File{}, grimmory.Book{}, false, nil
 	}
-	if !sameFileInventory(latest, current) || stableInventoryFingerprint(latest.Files, plan.Format) != expectedStableInventory {
+	if !sameFileInventory(latest, current) {
 		return grimmory.File{}, grimmory.Book{}, false, nil
 	}
 	latestCandidate, ok := uniqueIntentCandidate(latest.Files, plan.Format, expectedName, latestCanonical[0].ID)
@@ -1629,115 +1065,117 @@ func sameNormalizedName(left, right string) bool {
 	return left == right
 }
 
-func stableInventoryFingerprint(files []grimmory.File, excludedFormat string) string {
-	values := make([]inventoryFileKey, 0, len(files))
-	for _, file := range files {
-		if normalizeFormat(file.Format) == normalizeFormat(excludedFormat) {
-			continue
+// uploadDerivative performs a fresh, exact-target replacement. The receipt is
+// written before the first remote derivative mutation and the caller context
+// is used for every operation, including DELETE and the follow-up upload.
+func (s *Service) uploadDerivative(ctx context.Context, reference grimmory.BookReference, plan DerivativePlan, before grimmory.File, hadBefore bool, initialBook grimmory.Book, canonicalFormat string, canonical grimmory.File, canonicalSHA, workspace, outputPath, canonicalName string, options SyncOptions, receipt state.DerivedUploadReceipt) (bool, error) {
+	if !hadBefore {
+		if err := s.revalidateCreateInventory(ctx, reference, plan.Format, canonicalFormat, canonical, canonicalSHA, workspace); err != nil {
+			return false, err
 		}
-		values = append(values, inventoryFileKey{ID: file.ID, Name: file.Name, Format: normalizeFormat(file.Format), Type: normalizeFormat(file.Type), SizeKB: file.SizeKB, SHA256: strings.ToLower(strings.TrimSpace(file.SHA256))})
-	}
-	sort.Slice(values, func(i, j int) bool {
-		if values[i].ID != values[j].ID {
-			return values[i].ID < values[j].ID
+		if err := verifyLocalOutputUnchanged(outputPath, receipt.OutputSHA256, s.maxFileBytes); err != nil {
+			return false, err
 		}
-		if values[i].Name != values[j].Name {
-			return values[i].Name < values[j].Name
+		if err := s.setUploadReceipt(ctx, receipt); err != nil {
+			return false, fmt.Errorf("%w: %v", ErrState, err)
 		}
-		return values[i].Format < values[j].Format
-	})
-	encoded, _ := json.Marshal(values)
-	digest := sha256.Sum256(encoded)
-	return hex.EncodeToString(digest[:])
-}
-
-// uploadDerivative performs the only supported existing-file replacement
-// sequence: revalidate the complete book, delete the exact target, probe the
-// scoped inventory, and immediately upload the newly converted bytes. Once the
-// delete starts, the completion context outlives caller cancellation.
-func (s *Service) uploadDerivative(ctx context.Context, reference grimmory.BookReference, plan DerivativePlan, before grimmory.File, hadBefore bool, initialBook grimmory.Book, canonicalFormat string, canonical grimmory.File, canonicalSHA, workspace, outputPath, canonicalName string, options SyncOptions, intent state.DerivedUploadIntent, replacementAuthorized bool) (bool, context.Context, context.CancelFunc, error) {
-	if !plan.Blocked || !hadBefore {
-		if err := s.setUploadIntent(ctx, intent); err != nil {
-			return false, ctx, nil, fmt.Errorf("%w: %v", ErrState, err)
+		if err := ctx.Err(); err != nil {
+			return false, err
 		}
-		return false, ctx, nil, s.upload(ctx, reference, plan.Format, outputPath, canonicalName)
+		return true, s.upload(ctx, reference, plan.Format, outputPath, canonicalName)
 	}
 	if before.ID == "" || canonical.ID == "" || canonicalSHA == "" {
-		return false, ctx, nil, ErrSafeReplacementUnavailable
+		return false, ErrSafeReplacementUnavailable
 	}
 	if len(filesForFormat(initialBook.Files, plan.Format)) != 1 || len(filesForFormat(initialBook.Files, canonicalFormat)) != 1 || !uniqueFileIDs(initialBook.Files) {
-		return false, ctx, nil, fmt.Errorf("%w: initial replacement inventory is ambiguous", ErrSafeReplacementUnavailable)
+		return false, fmt.Errorf("%w: initial replacement inventory is ambiguous", ErrSafeReplacementUnavailable)
 	}
-	if err := verifyLocalOutputUnchanged(outputPath, intent.OutputSHA256, s.maxFileBytes); err != nil {
-		return false, ctx, nil, err
+	if err := verifyLocalOutputUnchanged(outputPath, receipt.OutputSHA256, s.maxFileBytes); err != nil {
+		return false, err
 	}
-	current, err := s.revalidateReplacementInventory(ctx, reference, plan.Format, before, canonicalFormat, canonical, canonicalSHA, workspace, options, true, true, replacementAuthorized)
+	current, err := s.revalidateReplacementInventory(ctx, reference, plan.Format, before, canonicalFormat, canonical, canonicalSHA, workspace, options)
 	if err != nil {
-		return false, ctx, nil, err
+		return false, err
 	}
 	target := currentTarget(current.Files, plan.Format)
-	intent.ReplacementTargetID = target.ID
-	intent.ReplacementTargetName = target.Name
-	intent.ReplacementTargetFormat = target.Format
-	intent.ReplacementTargetType = target.Type
-	if err := s.prepareReplacement(ctx, intent); err != nil {
-		return false, ctx, nil, fmt.Errorf("%w: %v", ErrState, err)
+	if err := s.setUploadReceipt(ctx, receipt); err != nil {
+		return false, fmt.Errorf("%w: %v", ErrState, err)
 	}
 	if err := ctx.Err(); err != nil {
-		return false, ctx, nil, err
+		return false, err
 	}
-	// Preflight has authorized this exact replacement. Keep that decision for
-	// the completion phase so a tag/ignore metadata change cannot strand the
-	// book after the old derivative has been deleted.
-	replacementAuthorized = true
-	completionCtx, cancel := s.replacementCompletionContext(ctx)
-	deleteErr := s.client.DeleteFileScoped(completionCtx, reference, currentTarget(current.Files, plan.Format).ID)
+	deleteErr := s.client.DeleteFileScoped(ctx, reference, target.ID)
 	if deleteErr != nil {
-		if _, _, recoverable, recoveryErr := s.recoverableIntentCandidate(completionCtx, reference, workspace, initialBook, canonical, plan, intent, canonicalSHA, canonicalName, canonicalFormat); recoveryErr != nil {
-			cancel()
-			return false, ctx, nil, recoveryErr
-		} else if recoverable {
-			return true, completionCtx, cancel, nil
+		if ctx.Err() != nil {
+			return true, ctx.Err()
+		}
+		currentAfter, readErr := s.client.GetLibraryBook(ctx, reference.LibraryID, reference.BookID)
+		if readErr != nil {
+			return true, deleteErr
+		}
+		if err := s.validateReplacementBook(currentAfter, reference, plan.Format, before, canonicalFormat, canonical, options, false, false); err != nil {
+			return true, deleteErr
 		}
 	}
-	if _, err := s.probeReplacementAfterDelete(completionCtx, reference, plan.Format, before, canonicalFormat, canonical, options, replacementAuthorized); err != nil {
-		cancel()
-		return false, ctx, nil, err
+	if _, err := s.probeReplacementAfterDelete(ctx, reference, plan.Format, before, canonicalFormat, canonical, options); err != nil {
+		return true, err
 	}
-	if err := verifyLocalOutputUnchanged(outputPath, intent.OutputSHA256, s.maxFileBytes); err != nil {
-		cancel()
-		return false, ctx, nil, err
+	if err := verifyLocalOutputUnchanged(outputPath, receipt.OutputSHA256, s.maxFileBytes); err != nil {
+		return true, err
 	}
-	if err := s.upload(completionCtx, reference, plan.Format, outputPath, canonicalName); err != nil {
-		if _, _, recoverable, recoveryErr := s.recoverableIntentCandidate(completionCtx, reference, workspace, initialBook, canonical, plan, intent, canonicalSHA, canonicalName, canonicalFormat); recoveryErr != nil {
-			cancel()
-			return true, ctx, nil, recoveryErr
-		} else if recoverable {
-			return true, completionCtx, cancel, nil
-		}
-		cancel()
-		return true, ctx, nil, err
-	}
-	return true, completionCtx, cancel, nil
+	return true, s.upload(ctx, reference, plan.Format, outputPath, canonicalName)
 }
 
-func (s *Service) probeReplacementAfterDelete(ctx context.Context, reference grimmory.BookReference, targetFormat string, before grimmory.File, canonicalFormat string, canonical grimmory.File, options SyncOptions, replacementAuthorized bool) (grimmory.Book, error) {
+func (s *Service) revalidateCreateInventory(ctx context.Context, reference grimmory.BookReference, targetFormat, canonicalFormat string, canonical grimmory.File, canonicalSHA, workspace string) error {
+	current, err := s.client.GetLibraryBook(ctx, reference.LibraryID, reference.BookID)
+	if err != nil {
+		return err
+	}
+	if hasTag(current, s.ignoreTag) {
+		return fmt.Errorf("%w: ignore authorization appeared before derivative creation", ErrSafeReplacementUnavailable)
+	}
+	if err := validateCanonicalBook(current, reference, canonicalFormat, canonical); err != nil {
+		return err
+	}
+	if len(filesForFormat(current.Files, targetFormat)) != 0 {
+		return fmt.Errorf("%w: derivative target appeared before creation", ErrSafeReplacementUnavailable)
+	}
+	if err := s.verifyCanonicalUnchanged(ctx, reference, canonicalFormat, canonicalSHA, workspace, targetFormat); err != nil {
+		return err
+	}
+	latest, err := s.client.GetLibraryBook(ctx, reference.LibraryID, reference.BookID)
+	if err != nil {
+		return err
+	}
+	if hasTag(latest, s.ignoreTag) || !sameFileInventory(latest, current) {
+		return fmt.Errorf("%w: create inventory changed during source verification", ErrSafeReplacementUnavailable)
+	}
+	if err := validateCanonicalBook(latest, reference, canonicalFormat, canonical); err != nil {
+		return err
+	}
+	if len(filesForFormat(latest.Files, targetFormat)) != 0 {
+		return fmt.Errorf("%w: derivative target appeared before creation", ErrSafeReplacementUnavailable)
+	}
+	return s.verifyCanonicalUnchanged(ctx, reference, canonicalFormat, canonicalSHA, workspace, targetFormat)
+}
+
+func (s *Service) probeReplacementAfterDelete(ctx context.Context, reference grimmory.BookReference, targetFormat string, before grimmory.File, canonicalFormat string, canonical grimmory.File, options SyncOptions) (grimmory.Book, error) {
 	current, err := s.client.GetLibraryBook(ctx, reference.LibraryID, reference.BookID)
 	if err != nil {
 		return grimmory.Book{}, err
 	}
-	if err := s.validateReplacementBook(current, reference, targetFormat, before, canonicalFormat, canonical, options, false, true, replacementAuthorized); err != nil {
+	if err := s.validateReplacementBook(current, reference, targetFormat, before, canonicalFormat, canonical, options, false, false); err != nil {
 		return grimmory.Book{}, err
 	}
 	return current, nil
 }
 
-func (s *Service) revalidateReplacementInventory(ctx context.Context, reference grimmory.BookReference, targetFormat string, before grimmory.File, canonicalFormat string, canonical grimmory.File, canonicalSHA, workspace string, options SyncOptions, targetPresent, checkAuthorization, replacementAuthorized bool) (grimmory.Book, error) {
+func (s *Service) revalidateReplacementInventory(ctx context.Context, reference grimmory.BookReference, targetFormat string, before grimmory.File, canonicalFormat string, canonical grimmory.File, canonicalSHA, workspace string, options SyncOptions) (grimmory.Book, error) {
 	current, err := s.client.GetLibraryBook(ctx, reference.LibraryID, reference.BookID)
 	if err != nil {
 		return grimmory.Book{}, err
 	}
-	if err := s.validateReplacementBook(current, reference, targetFormat, before, canonicalFormat, canonical, options, targetPresent, checkAuthorization, replacementAuthorized); err != nil {
+	if err := s.validateReplacementBook(current, reference, targetFormat, before, canonicalFormat, canonical, options, true, true); err != nil {
 		return grimmory.Book{}, err
 	}
 	if err := s.verifyCanonicalUnchanged(ctx, reference, canonicalFormat, canonicalSHA, workspace, targetFormat); err != nil {
@@ -1750,7 +1188,7 @@ func (s *Service) revalidateReplacementInventory(ctx context.Context, reference 
 	if !sameFileInventory(latest, current) {
 		return grimmory.Book{}, fmt.Errorf("%w: replacement inventory changed during source verification", ErrSafeReplacementUnavailable)
 	}
-	if err := s.validateReplacementBook(latest, reference, targetFormat, before, canonicalFormat, canonical, options, targetPresent, checkAuthorization, replacementAuthorized); err != nil {
+	if err := s.validateReplacementBook(latest, reference, targetFormat, before, canonicalFormat, canonical, options, true, true); err != nil {
 		return grimmory.Book{}, err
 	}
 	if err := s.verifyCanonicalUnchanged(ctx, reference, canonicalFormat, canonicalSHA, workspace, targetFormat); err != nil {
@@ -1759,7 +1197,7 @@ func (s *Service) revalidateReplacementInventory(ctx context.Context, reference 
 	return latest, nil
 }
 
-func (s *Service) validateReplacementBook(current grimmory.Book, reference grimmory.BookReference, targetFormat string, before grimmory.File, canonicalFormat string, canonical grimmory.File, options SyncOptions, targetPresent, checkAuthorization, replacementAuthorized bool) error {
+func (s *Service) validateReplacementBook(current grimmory.Book, reference grimmory.BookReference, targetFormat string, before grimmory.File, canonicalFormat string, canonical grimmory.File, options SyncOptions, targetPresent, checkAuthorization bool) error {
 	if current.ID != reference.BookID || current.LibraryID != reference.LibraryID {
 		return fmt.Errorf("%w: replacement inventory identity changed", ErrSafeReplacementUnavailable)
 	}
@@ -1770,7 +1208,7 @@ func (s *Service) validateReplacementBook(current grimmory.Book, reference grimm
 	if len(canonicalFiles) != 1 || !sameFileIdentity(canonicalFiles[0], canonical) || canonicalFiles[0].ID == "" {
 		return fmt.Errorf("%w: canonical source changed or is ambiguous", ErrSafeReplacementUnavailable)
 	}
-	if checkAuthorization && !replacementAuthorized && !s.replacementAllowed(current, options) {
+	if checkAuthorization && !s.replacementAllowed(current, options) {
 		return fmt.Errorf("%w: replacement authorization changed", ErrSafeReplacementUnavailable)
 	}
 	targets := filesForFormat(current.Files, targetFormat)
@@ -1915,55 +1353,6 @@ func sameFileInventory(left, right grimmory.Book) bool {
 	return true
 }
 
-func (s *Service) clearReplacementTag(ctx context.Context, reference grimmory.BookReference, expected grimmory.Book, tag string) error {
-	if tag == "" {
-		return errors.New("replacement tag is empty")
-	}
-	current, err := s.client.GetLibraryBook(ctx, reference.LibraryID, reference.BookID)
-	if err != nil {
-		return err
-	}
-	if current.ID != reference.BookID || current.LibraryID != reference.LibraryID {
-		return fmt.Errorf("%w: replacement book identity changed before tag cleanup", ErrSafeReplacementUnavailable)
-	}
-	if !sameFileInventory(current, expected) {
-		return fmt.Errorf("%w: replacement inventory changed before tag cleanup", ErrSafeReplacementUnavailable)
-	}
-	if !hasTag(current, tag) {
-		return nil
-	}
-	tagger, ok := s.client.(FailureTagger)
-	if !ok {
-		return errors.New("replacement tag mutation is unsupported")
-	}
-	if err := tagger.RemoveBookTagScoped(ctx, reference, tag); err != nil {
-		// A remote error may have been returned after the tag was removed. Restore
-		// the authorization idempotently before reporting cleanup failure.
-		if restoreErr := tagger.AddBookTagScoped(context.WithoutCancel(ctx), reference, tag); restoreErr != nil {
-			return errors.Join(err, fmt.Errorf("restore replacement tag after ambiguous removal: %w", restoreErr))
-		}
-		return err
-	}
-	// SetBookTagScoped verifies the metadata mutation, while this final scoped
-	// read ensures the one-shot cleanup did not race a file inventory change.
-	after, err := s.client.GetLibraryBook(ctx, reference.LibraryID, reference.BookID)
-	if err != nil {
-		if restoreErr := tagger.AddBookTagScoped(context.WithoutCancel(ctx), reference, tag); restoreErr != nil {
-			return errors.Join(err, fmt.Errorf("restore replacement tag after cleanup verification: %w", restoreErr))
-		}
-		return err
-	}
-	if sameFileInventory(after, expected) {
-		return nil
-	}
-	// Retain the authorization if the inventory changed during the mutation.
-	// The lock-aware tag client changes only this tag and restores tagsLocked.
-	if restoreErr := tagger.AddBookTagScoped(context.WithoutCancel(ctx), reference, tag); restoreErr != nil {
-		return errors.Join(ErrSafeReplacementUnavailable, restoreErr)
-	}
-	return fmt.Errorf("%w: replacement inventory changed during tag cleanup", ErrSafeReplacementUnavailable)
-}
-
 func (s *Service) log(level logging.Level, message string, values ...string) {
 	if s.logger == nil {
 		return
@@ -1981,6 +1370,7 @@ type DerivativePlan struct {
 	Reason                string
 	GenerationFingerprint string
 	Blocked               bool
+	Unsafe                bool
 }
 
 // PlanDerivatives returns actions for configured outputs. Existing derivatives
@@ -2001,11 +1391,16 @@ func PlanDerivatives(files []grimmory.File, outputs []string, mainFormat, canoni
 		if format == "" || format == normalizeFormat(mainFormat) {
 			continue
 		}
-		existing, exists := FindFile(files, format)
-		if !exists {
+		candidates := filesForFormat(files, format)
+		if len(candidates) > 1 {
+			result = append(result, DerivativePlan{Format: format, Action: "blocked", Reason: "ambiguous_output", GenerationFingerprint: desiredFingerprints[format], Blocked: true, Unsafe: true})
+			continue
+		}
+		if len(candidates) == 0 {
 			result = append(result, derivativePlan(format, "create", "missing_output", desiredFingerprints))
 			continue
 		}
+		existing := candidates[0]
 		if force {
 			result = append(result, derivativePlan(format, "rebuild", "forced", desiredFingerprints))
 			continue
@@ -2184,8 +1579,9 @@ func SelectSource(files []grimmory.File, mainFormat string, allowed []string) (g
 		if format == "" || format == normalizeFormat(mainFormat) {
 			continue
 		}
-		if file, ok := FindFile(files, format); ok {
-			return file, true
+		candidates := filesForFormat(files, format)
+		if len(candidates) == 1 {
+			return candidates[0], true
 		}
 	}
 	return grimmory.File{}, false
@@ -2352,8 +1748,6 @@ func codeForError(err error, fallback string) string {
 		return "state_write_failed"
 	case errors.Is(err, ErrSafeReplacementUnavailable):
 		return SafeReplacementUnavailableCode
-	case errors.Is(err, ErrReplacementTagMutation):
-		return "replacement_tag_failed"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "timeout"
 	case errors.Is(err, context.Canceled):

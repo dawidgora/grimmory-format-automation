@@ -141,28 +141,9 @@ func (r *fakeReconciler) SetFailureTag(ctx context.Context, libraryID, bookID st
 }
 
 type memoryStore struct {
-	mu                 sync.Mutex
-	states             map[string]state.PollState
-	pendingReplacement map[string]bool
-	failures           int
-}
-
-func (s *memoryStore) HasPendingReplacementTag(_ context.Context, _, bookID string) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.pendingReplacement[bookID], nil
-}
-
-func (s *memoryStore) MarkPollPending(_ context.Context, _, bookID, fingerprint string, updatedAt time.Time) (state.PollState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	value, exists := s.states[bookID]
-	if !exists || value.ObservationFingerprint != fingerprint {
-		return state.PollState{}, errors.New("observation changed")
-	}
-	value.Status, value.NextAttemptAt, value.ErrorCode, value.UpdatedAt = state.PollStatusPending, time.Time{}, "", updatedAt
-	s.states[bookID] = value
-	return value, nil
+	mu       sync.Mutex
+	states   map[string]state.PollState
+	failures int
 }
 
 func (s *memoryStore) UpsertPollObservation(_ context.Context, libraryID, bookID, fingerprint string, seenAt time.Time) (state.PollState, error) {
@@ -236,7 +217,7 @@ func testBook() grimmory.Book {
 	return grimmory.Book{ID: "book", LibraryID: "1", Files: []grimmory.File{{ID: "epub-id", Name: "book.epub", Format: "epub"}}, Metadata: grimmory.BookMetadata{Title: "Book"}}
 }
 
-func newTestScheduler(t *testing.T, remote *fakeRemote, store *memoryStore, reconciler *fakeReconciler, now *time.Time) *Scheduler {
+func newTestScheduler(t *testing.T, remote *fakeRemote, store Store, reconciler *fakeReconciler, now *time.Time) *Scheduler {
 	t.Helper()
 	reconciler.remote = remote
 	scheduler, err := New(Options{
@@ -411,88 +392,6 @@ func TestSchedulerIgnoredBookClearsFailureTagWithoutProcessing(t *testing.T) {
 	}
 }
 
-func TestSchedulerProcessesDestructiveReplacementPhaseBeforeIgnoreTag(t *testing.T) {
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	book := testBook()
-	book.Metadata.Tags = []string{"ignore"}
-	remote := &fakeRemote{books: []grimmory.Book{book}, detail: []grimmory.Book{book, book}}
-	store := &memoryStore{pendingReplacement: map[string]bool{book.ID: true}}
-	reconciler := &fakeReconciler{}
-	scheduler := newTestScheduler(t, remote, store, reconciler, &now)
-	scheduler.ignoreTag = "ignore"
-	fingerprint := grimmory.ObservationFingerprintIgnoringTags(book, scheduler.ignoreTag, scheduler.failedTag)
-	if _, err := store.UpsertPollObservation(context.Background(), "1", book.ID, fingerprint, now); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.MarkPollSuccess(context.Background(), "1", book.ID, fingerprint, now); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := scheduler.Scan(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if len(reconciler.calls) != 1 || reconciler.calls[0] != "1/book" {
-		t.Fatalf("destructive replacement phase was ignored: calls=%v", reconciler.calls)
-	}
-	store.mu.Lock()
-	store.pendingReplacement[book.ID] = false
-	store.mu.Unlock()
-	remote.mu.Lock()
-	remote.detail = []grimmory.Book{book}
-	remote.mu.Unlock()
-	if err := scheduler.Scan(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if len(reconciler.calls) != 1 {
-		t.Fatalf("cleared replacement phase repeated unchanged observation: calls=%v", reconciler.calls)
-	}
-}
-
-func TestSchedulerKeepsIgnoredRecoveryPendingUntilTagRemoval(t *testing.T) {
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	book := testBook()
-	book.Metadata.Tags = []string{"ignore"}
-	remote := &fakeRemote{books: []grimmory.Book{book}, detail: []grimmory.Book{book}}
-	store := &memoryStore{pendingReplacement: map[string]bool{book.ID: true}}
-	reconciler := &fakeReconciler{result: reconcile.Result{Status: "ignored"}}
-	scheduler := newTestScheduler(t, remote, store, reconciler, &now)
-	scheduler.ignoreTag = "ignore"
-	fingerprint := grimmory.ObservationFingerprintIgnoringTags(book, scheduler.ignoreTag, scheduler.failedTag)
-	if _, err := store.UpsertPollObservation(context.Background(), "1", book.ID, fingerprint, now); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.MarkPollSuccess(context.Background(), "1", book.ID, fingerprint, now); err != nil {
-		t.Fatal(err)
-	}
-	if err := scheduler.Scan(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	store.mu.Lock()
-	firstState := store.states[book.ID]
-	store.mu.Unlock()
-	if firstState.Status != state.PollStatusPending || len(reconciler.calls) != 1 {
-		t.Fatalf("ignored recovery was marked applied: state=%+v calls=%v", firstState, reconciler.calls)
-	}
-
-	remote.mu.Lock()
-	remote.books[0].Metadata.Tags = nil
-	remote.detail = []grimmory.Book{remote.books[0], remote.books[0]}
-	remote.mu.Unlock()
-	store.mu.Lock()
-	store.pendingReplacement[book.ID] = false
-	store.mu.Unlock()
-	reconciler.result = reconcile.Result{Status: "completed"}
-	if err := scheduler.Scan(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	store.mu.Lock()
-	finalState := store.states[book.ID]
-	store.mu.Unlock()
-	if finalState.Status != state.PollStatusCurrent || len(reconciler.calls) != 2 {
-		t.Fatalf("ignored recovery did not resume after tag removal: state=%+v calls=%v", finalState, reconciler.calls)
-	}
-}
-
 func TestSchedulerIgnoredBookTagCleanupFailureDoesNotFailScan(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	book := testBook()
@@ -548,6 +447,65 @@ func TestSchedulerIgnoredBookWithEmptyFailureTagIsNoOp(t *testing.T) {
 	remote.mu.Unlock()
 	if len(reconciler.calls) != 0 || len(removed) != 0 {
 		t.Fatalf("empty failure tag configuration calls=%v removed=%v", reconciler.calls, removed)
+	}
+}
+
+func TestSchedulerIgnoredSyncDoesNotMarkObservationSuccessful(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	book := testBook()
+	remote := &fakeRemote{books: []grimmory.Book{book}, detail: []grimmory.Book{book}}
+	store := &memoryStore{}
+	reconciler := &fakeReconciler{result: reconcile.Result{Status: "ignored"}}
+	scheduler := newTestScheduler(t, remote, store, reconciler, &now)
+	fingerprint := grimmory.ObservationFingerprint(book)
+	pollState, err := store.UpsertPollObservation(context.Background(), "1", book.ID, fingerprint, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.process(context.Background(), pollState); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	got := store.states[book.ID]
+	store.mu.Unlock()
+	if got.Status != state.PollStatusPending || got.AppliedFingerprint != "" || len(reconciler.calls) != 1 {
+		t.Fatalf("ignored sync consumed observation: state=%+v calls=%v", got, reconciler.calls)
+	}
+}
+
+func TestSchedulerRestartReprocessesPendingObservation(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	book := testBook()
+	remote := &fakeRemote{books: []grimmory.Book{book}, detail: []grimmory.Book{book, book}}
+	dir := t.TempDir()
+	store, err := state.Open(dir, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciler := &fakeReconciler{result: reconcile.Result{Status: "ignored"}}
+	scheduler := newTestScheduler(t, remote, store, reconciler, &now)
+	if err := scheduler.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := state.Open(dir, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	restarted := newTestScheduler(t, remote, reopened, reconciler, &now)
+	if err := restarted.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	reopenedState, err := reopened.ListDuePollStates(context.Background(), "1", now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reconciler.calls) != 2 || len(reopenedState) != 1 || reopenedState[0].Status != state.PollStatusPending {
+		t.Fatalf("pending observation was not replayed after restart: calls=%v due=%+v", reconciler.calls, reopenedState)
 	}
 }
 
@@ -609,34 +567,6 @@ func TestSchedulerRetriesTransientThenExhaustsRetries(t *testing.T) {
 	store.mu.Unlock()
 	if value.Status != state.PollStatusFailed || value.AttemptCount != 2 || store.failures != 2 {
 		t.Fatalf("retry state = %+v failures=%d", value, store.failures)
-	}
-}
-
-func TestSchedulerRetriesReplacementTagCleanupFailure(t *testing.T) {
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	book := testBook()
-	remote := &fakeRemote{books: []grimmory.Book{book}, detail: []grimmory.Book{book, book}}
-	store := &memoryStore{}
-	reconciler := &fakeReconciler{err: reconcile.ErrReplacementTagMutation}
-	scheduler := newTestScheduler(t, remote, store, reconciler, &now)
-	if err := scheduler.Scan(context.Background()); err == nil {
-		t.Fatal("expected replacement-tag cleanup failure")
-	}
-	store.mu.Lock()
-	first := store.states[book.ID]
-	store.mu.Unlock()
-	if first.Status != state.PollStatusRetry || first.AttemptCount != 1 {
-		t.Fatalf("replacement cleanup was not scheduled for retry: %+v", first)
-	}
-	now = now.Add(time.Second)
-	if err := scheduler.Scan(context.Background()); err == nil {
-		t.Fatal("expected replacement-tag cleanup retry failure")
-	}
-	store.mu.Lock()
-	second := store.states[book.ID]
-	store.mu.Unlock()
-	if second.Status != state.PollStatusFailed || second.AttemptCount != 2 || len(reconciler.calls) != 2 {
-		t.Fatalf("replacement cleanup retry state=%+v calls=%v", second, reconciler.calls)
 	}
 }
 
