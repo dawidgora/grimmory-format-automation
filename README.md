@@ -4,6 +4,12 @@ This Go service reconciles ebook formats in Grimmory and uses one replica.
 Grimmory is the source of truth. The service uses Grimmory's HTTP API, Calibre
 `ebook-convert`, and SQLite state in `/data`.
 
+## Alpha status
+
+This project is intended for early adopters. Back up your library before use.
+Start with a disposable test library and run only one service instance.
+Replacement is not atomic and can temporarily leave a derived format absent.
+
 ## Architecture
 
 ```mermaid
@@ -50,6 +56,11 @@ flowchart LR
 
 Docker Compose polling is the default.
 
+- Polling writes to Grimmory as soon as the service starts.
+- Use a test library first. Remove `command: ["--poll"]` to start in manual-only mode.
+- Use HTTPS for Grimmory. HTTP exposes credentials and book content to network observers.
+- If `API_KEY` is blank, the service generates a key and stores it in `/data/api-key`.
+- The example exposes the API only on the Docker host's loopback interface.
 - Save this file as `docker-compose.yml`.
 - Replace the placeholder values.
 
@@ -61,7 +72,7 @@ services:
     # Remove `command: ["--poll"]` for manual-only operation.
     command: ["--poll"]
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - converter_data:/data
     environment:
@@ -81,7 +92,8 @@ volumes:
 ```
 
 Both Compose files publish the API on the configured host port. Adjust the host
-binding to choose network exposure.
+binding to choose network exposure. The example above limits access to the Docker host.
+Use a TLS reverse proxy if you expose the API beyond a trusted local network.
 
 - Start the service:
 
