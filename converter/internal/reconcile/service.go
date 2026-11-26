@@ -690,7 +690,7 @@ func (s *Service) Sync(ctx context.Context, libraryID, bookID string, options Sy
 			verifiedBook, verifyErr := s.client.GetLibraryBook(ctx, libraryID, bookID)
 			if verifyErr != nil {
 				conversionErr = verifyErr
-			} else if verifiedFile, ok := findUploadedFile(verifiedBook.Files, plan.Format, desiredOutputName(canonicalName, plan.Format)); !ok {
+			} else if verifiedFile, ok := findUploadedFile(verifiedBook.Files, plan.Format, mainFile.ID); !ok {
 				conversionErr = ErrVerification
 			} else if conversionErr = s.verifyUploadedFile(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, before, hadBefore, verifiedFile, outputSHA, workspace, verifiedBook.Files, mainFile.ID); conversionErr != nil {
 			} else if conversionErr = s.revalidateCanonicalSource(ctx, grimmory.BookReference{LibraryID: libraryID, BookID: bookID}, policy.MainFormat, mainFile, canonicalSHA, canonicalPath, workspace, plan.Format, verifiedBook); conversionErr != nil {
@@ -1004,7 +1004,7 @@ func (s *Service) recoverableReceiptCandidate(ctx context.Context, reference gri
 	if len(currentCanonical) != 1 || !sameFileIdentity(currentCanonical[0], canonical) {
 		return grimmory.File{}, grimmory.Book{}, false, nil
 	}
-	candidate, ok := uniqueIntentCandidate(current.Files, plan.Format, expectedName, currentCanonical[0].ID)
+	candidate, ok := uniqueIntentCandidate(current.Files, plan.Format, currentCanonical[0].ID)
 	if !ok {
 		return grimmory.File{}, grimmory.Book{}, false, nil
 	}
@@ -1042,20 +1042,20 @@ func (s *Service) recoverableReceiptCandidate(ctx context.Context, reference gri
 	if !sameFileInventory(latest, current) {
 		return grimmory.File{}, grimmory.Book{}, false, nil
 	}
-	latestCandidate, ok := uniqueIntentCandidate(latest.Files, plan.Format, expectedName, latestCanonical[0].ID)
+	latestCandidate, ok := uniqueIntentCandidate(latest.Files, plan.Format, latestCanonical[0].ID)
 	if !ok || latestCandidate.ID != candidate.ID {
 		return grimmory.File{}, grimmory.Book{}, false, nil
 	}
 	return candidate, latest, true, nil
 }
 
-func uniqueIntentCandidate(files []grimmory.File, format, expectedName, canonicalID string) (grimmory.File, bool) {
+func uniqueIntentCandidate(files []grimmory.File, format, canonicalID string) (grimmory.File, bool) {
 	candidates := filesForFormat(files, format)
 	if len(candidates) != 1 || !uniqueFileIDs(files) {
 		return grimmory.File{}, false
 	}
 	candidate := candidates[0]
-	if candidate.ID == "" || candidate.ID == canonicalID || !sameNormalizedName(candidate.Name, expectedName) {
+	if candidate.ID == "" || candidate.ID == canonicalID {
 		return grimmory.File{}, false
 	}
 	return candidate, true
@@ -1426,10 +1426,6 @@ func PlanDerivatives(files []grimmory.File, outputs []string, mainFormat, canoni
 			result = append(result, derivativePlan(format, "rebuild", "output_identity_changed", desiredFingerprints))
 			continue
 		}
-		if canonicalName != "" && existing.Name != desiredOutputName(canonicalName, format) {
-			result = append(result, derivativePlan(format, "rebuild", "output_name_changed", desiredFingerprints))
-			continue
-		}
 		if canonicalSHA != "" && tracked && previous.SourceSHA256 != "" && previous.SourceSHA256 != canonicalSHA {
 			result = append(result, derivativePlan(format, "rebuild", "canonical_hash_changed", desiredFingerprints))
 			continue
@@ -1602,13 +1598,13 @@ func FindFile(files []grimmory.File, format string) (grimmory.File, bool) {
 	return selected, found
 }
 
-func findUploadedFile(files []grimmory.File, format, desiredName string) (grimmory.File, bool) {
+func findUploadedFile(files []grimmory.File, format, canonicalID string) (grimmory.File, bool) {
 	candidates := filesForFormat(files, format)
-	if len(candidates) != 1 {
+	if len(candidates) != 1 || !uniqueFileIDs(files) {
 		return grimmory.File{}, false
 	}
 	candidate := candidates[0]
-	if candidate.Name != desiredName {
+	if candidate.ID == "" || candidate.ID == canonicalID {
 		return grimmory.File{}, false
 	}
 	return candidate, true

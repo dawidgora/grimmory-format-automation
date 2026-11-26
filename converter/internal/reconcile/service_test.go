@@ -27,6 +27,7 @@ type fakeRemote struct {
 	uploads                []string
 	deletes                []string
 	uploadAfterMutationErr error
+	renameUploads          bool
 	afterUploadHook        func()
 	beforeDeleteHook       func()
 	afterDeleteHook        func()
@@ -78,6 +79,9 @@ func (r *fakeRemote) UploadFileNamedScoped(ctx context.Context, _ grimmory.BookR
 	format = normalizeFormat(format)
 	r.content[format] = append([]byte(nil), data...)
 	r.uploads = append(r.uploads, format)
+	if r.renameUploads {
+		name = "Automation Evidence Synthetic." + format
+	}
 	r.book.Files = append(r.book.Files, grimmory.File{ID: fmt.Sprintf("%s-%d", format, len(r.uploads)), Format: format, Name: name, SHA256: hashBytes(data), TrustedMTime: true, MTime: time.Now().UTC()})
 	err = r.uploadAfterMutationErr
 	hook := r.afterUploadHook
@@ -86,6 +90,26 @@ func (r *fakeRemote) UploadFileNamedScoped(ctx context.Context, _ grimmory.BookR
 		hook()
 	}
 	return err
+}
+
+func TestRenamedUploadVerifiesAndRemainsUnchanged(t *testing.T) {
+	remote := &fakeRemote{book: replacementBook(), content: map[string][]byte{"epub": []byte("main")}, renameUploads: true}
+	store := &memoryStore{}
+	service := replacementService(remote, store, "replace")
+	first, err := service.Sync(context.Background(), "1", "book", SyncOptions{})
+	if err != nil || first.Status != "completed" || first.Derivatives[0].Status != "uploaded" {
+		t.Fatalf("renamed upload result=%+v err=%v", first, err)
+	}
+	second, err := service.Sync(context.Background(), "1", "book", SyncOptions{})
+	if err != nil || second.Status != "completed" || second.Derivatives[0].Status != "unchanged" {
+		t.Fatalf("second sync result=%+v err=%v", second, err)
+	}
+	remote.mu.Lock()
+	uploads := len(remote.uploads)
+	remote.mu.Unlock()
+	if uploads != 1 {
+		t.Fatalf("renamed output uploaded %d times", uploads)
+	}
 }
 
 func (r *fakeRemote) DeleteFileScoped(ctx context.Context, _ grimmory.BookReference, fileID string) error {
@@ -409,7 +433,7 @@ func TestAmbiguousPostIsAdoptedFromReceipt(t *testing.T) {
 }
 
 func TestFailedStateCommitIsAdoptedFromReceipt(t *testing.T) {
-	remote := &fakeRemote{book: replacementBook(), content: map[string][]byte{"epub": []byte("main")}}
+	remote := &fakeRemote{book: replacementBook(), content: map[string][]byte{"epub": []byte("main")}, renameUploads: true}
 	store := &memoryStore{setDerError: errors.New("state unavailable")}
 	first, err := replacementService(remote, store, "replace").Sync(context.Background(), "1", "book", SyncOptions{})
 	if err == nil || first.Status != "partial" {
